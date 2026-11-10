@@ -210,8 +210,9 @@ def _run_problems_loop(
             f"{len(pending)} pending / {len(active_problems)} total problems..."
         )
 
-    for start in range(0, len(pending), batch_size):
-        batch = pending[start : start + batch_size]
+    step_size = max(1, len(pending)) if backend == "vllm" else max(1, batch_size)
+    for start in range(0, len(pending), step_size):
+        batch = pending[start : start + step_size]
         prompts = [
             format_chat_prompt(tokenizer, p["prompt"], enable_thinking=True)
             for p in batch

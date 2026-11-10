@@ -42,6 +42,7 @@ from .gen import (
     evict_hf_models_from_gpu,
     format_chat_prompt,
     generate,
+    run_vllm_in_subprocess,
     split_cot_and_answer,
 )
 from .sandbox import (
@@ -103,6 +104,7 @@ __all__ = [
     "evict_hf_models_from_gpu",
     "format_chat_prompt",
     "generate",
+    "run_vllm_in_subprocess",
     "split_cot_and_answer",
     "SandboxResult",
     "check_solution",

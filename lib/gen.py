@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -448,22 +450,244 @@ def evict_hf_models_from_gpu(model: Any | None = None) -> None:
         torch.cuda.empty_cache()
 
 
-_ACTIVE_VLLM_CACHE: dict[str, Any] = {
-    "key": None,
-    "engine": None,
-}
+def run_vllm_in_subprocess(
+    request_payload: dict[str, Any],
+    *,
+    subprocess_runner: Any | None = None,
+) -> dict[str, Any]:
+    """Run a single vLLM engine job in an isolated child process that writes its results
+    to a JSON file and exits, guaranteeing 100% GPU VRAM release when the process terminates.
+    The parent process only reads the resulting JSON file.
+    """
+    import json
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory(prefix="vllm_subproc_") as tmpdir:
+        tmp_path = Path(tmpdir)
+        in_json = tmp_path / "vllm_input.json"
+        out_json = tmp_path / "vllm_output.json"
+        in_json.write_text(json.dumps(request_payload, ensure_ascii=False), encoding="utf-8")
+
+        if subprocess_runner is not None:
+            subprocess_runner(in_json, out_json)
+        else:
+            repo_root = str(Path(__file__).resolve().parent.parent)
+            env = dict(os.environ)
+            existing_py = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{existing_py}" if existing_py else repo_root
+
+            proc = subprocess.run(
+                [sys.executable, "-m", "lib.gen", "--vllm-worker", str(in_json), str(out_json)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"Subprocesso vLLM falhou (exit={proc.returncode}):\n"
+                    f"STDERR: {proc.stderr}\nSTDOUT: {proc.stdout}"
+                )
+
+        if not out_json.exists():
+            raise RuntimeError(f"Subprocesso vLLM terminou sem gravar o arquivo JSON: {out_json}")
+
+        return json.loads(out_json.read_text(encoding="utf-8"))
 
 
-def _shutdown_cached_vllm_engine() -> None:
-    """Release any cached vLLM engine and free GPU memory."""
-    import gc
+def _vllm_subprocess_worker_main(in_json_path: str, out_json_path: str) -> None:
+    """Entry point executed inside the isolated child process for a single vLLM run."""
+    import json
+    import os
+    from pathlib import Path
 
-    if _ACTIVE_VLLM_CACHE.get("engine") is not None:
-        _ACTIVE_VLLM_CACHE["engine"] = None
-        _ACTIVE_VLLM_CACHE["key"] = None
-        gc.collect()
-        if torch is not None and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    req = json.loads(Path(in_json_path).read_text(encoding="utf-8"))
+    mode = req.get("mode", "generate")
+    model_name = str(req.get("model_name", DORY_HF_REPO))
+    prompts: list[str] = list(req.get("prompts", []))
+    max_new_tokens = int(req.get("max_new_tokens", 4096))
+    temperature = float(req.get("temperature", 0.0))
+    top_p = float(req.get("top_p", 1.0))
+    n_samples = int(req.get("n_samples", 1))
+    seed = int(req.get("seed", 42))
+    n_loops = req.get("n_loops")
+    hf_overrides = req.get("hf_overrides") or {}
+    limit_mm_per_prompt = req.get("limit_mm_per_prompt")
+
+    # Built-in fake runner mode for unit tests (runs in a real child subprocess without requiring GPU/vLLM)
+    if req.get("fake_vllm", False):
+        if mode == "equivalence":
+            k_val = int(n_loops if n_loops is not None else hf_overrides.get("n_recurrent_loops", 2))
+            items: list[dict[str, Any]] = []
+            for p_idx, p_str in enumerate(prompts):
+                p_ids = [1, 5 + p_idx, 6]
+                gen_ids = [(10 + k_val + s_i + p_idx) % 25 for s_i in range(max_new_tokens)]
+                steps = [
+                    {"top1_id": int(tid), "top1_logprob": -0.1 * (s_i + 1)}
+                    for s_i, tid in enumerate(gen_ids)
+                ]
+                items.append(
+                    {
+                        "prompt_token_ids": p_ids,
+                        "generated_token_ids": gen_ids,
+                        "steps": steps,
+                    }
+                )
+            payload = {
+                "pid": os.getpid(),
+                "mode": mode,
+                "model_name": model_name,
+                "n_loops": n_loops,
+                "hf_overrides": hf_overrides,
+                "items": items,
+            }
+        else:
+            outputs_list: list[dict[str, Any]] = []
+            for p_idx, _ in enumerate(prompts):
+                for _ in range(n_samples):
+                    outputs_list.append(
+                        {
+                            "prompt_idx": p_idx,
+                            "text": "<think> step 1 add a and b </think> return a + b",
+                            "token_ids": [3, 5, 6, 12, 15, 16, 17, 4, 18, 15, 17],
+                        }
+                    )
+            payload = {
+                "pid": os.getpid(),
+                "mode": mode,
+                "model_name": model_name,
+                "n_loops": n_loops,
+                "hf_overrides": hf_overrides,
+                "limit_mm_per_prompt": limit_mm_per_prompt,
+                "elapsed_s": 0.01,
+                "think_open_token_id": 3,
+                "think_close_token_id": 4,
+                "outputs": outputs_list,
+            }
+        Path(out_json_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return
+
+    from vllm import LLM, SamplingParams  # type: ignore[import-not-found]
+
+    llm_kwargs: dict[str, Any] = {
+        "model": model_name,
+        "trust_remote_code": True,
+        "dtype": "bfloat16",
+        "seed": seed,
+    }
+    if limit_mm_per_prompt is not None:
+        llm_kwargs["limit_mm_per_prompt"] = limit_mm_per_prompt
+    if hf_overrides:
+        llm_kwargs["hf_overrides"] = hf_overrides
+    if req.get("gpu_memory_utilization") is not None:
+        llm_kwargs["gpu_memory_utilization"] = float(req["gpu_memory_utilization"])
+    if req.get("max_model_len") is not None:
+        llm_kwargs["max_model_len"] = int(req["max_model_len"])
+
+    llm = LLM(**llm_kwargs)
+
+    if mode == "equivalence":
+        sp = SamplingParams(
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=max_new_tokens,
+            logprobs=int(req.get("logprobs", 5)),
+            seed=seed,
+        )
+        outs = llm.generate(prompts, sp)
+        loop_items: list[dict[str, Any]] = []
+        for req_out in outs:
+            p_ids = [int(x) for x in req_out.prompt_token_ids]
+            comp = req_out.outputs[0]
+            gen_ids = [int(x) for x in comp.token_ids]
+            step_list: list[dict[str, Any]] = []
+            for s_idx, tok_id in enumerate(gen_ids):
+                lp_dict = comp.logprobs[s_idx] if (comp.logprobs and s_idx < len(comp.logprobs)) else {}
+                if lp_dict and tok_id in lp_dict:
+                    raw_lp = lp_dict[tok_id]
+                    lp_val = float(raw_lp.logprob if hasattr(raw_lp, "logprob") else raw_lp)
+                else:
+                    lp_val = 0.0
+                step_list.append(
+                    {
+                        "top1_id": int(tok_id),
+                        "top1_logprob": lp_val,
+                    }
+                )
+            loop_items.append(
+                {
+                    "prompt_token_ids": p_ids,
+                    "generated_token_ids": gen_ids,
+                    "steps": step_list,
+                }
+            )
+        payload = {
+            "pid": os.getpid(),
+            "mode": mode,
+            "model_name": model_name,
+            "n_loops": n_loops,
+            "hf_overrides": hf_overrides,
+            "items": loop_items,
+        }
+        Path(out_json_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return
+
+    vllm_tok = None
+    if hasattr(llm, "get_tokenizer"):
+        try:
+            vllm_tok = llm.get_tokenizer()
+        except Exception:
+            vllm_tok = None
+
+    open_ids = _resolve_tag_token_ids(THINK_OPEN, vllm_tok)
+    close_ids = _resolve_tag_token_ids(THINK_CLOSE, vllm_tok)
+
+    sampling_params = SamplingParams(
+        n=n_samples,
+        temperature=temperature,
+        top_p=top_p if temperature > 1e-5 else 1.0,
+        max_tokens=max_new_tokens,
+        seed=seed,
+    )
+
+    t0 = time.perf_counter()
+    request_outputs = llm.generate(prompts, sampling_params)
+    total_elapsed = time.perf_counter() - t0
+
+    serialized_outputs: list[dict[str, Any]] = []
+    for p_idx, req_out in enumerate(request_outputs):
+        for sample in req_out.outputs:
+            s_ids = (
+                [int(t) for t in sample.token_ids]
+                if hasattr(sample, "token_ids") and sample.token_ids is not None
+                else None
+            )
+            serialized_outputs.append(
+                {
+                    "prompt_idx": p_idx,
+                    "text": sample.text,
+                    "token_ids": s_ids,
+                }
+            )
+
+    payload = {
+        "pid": os.getpid(),
+        "mode": mode,
+        "model_name": model_name,
+        "n_loops": n_loops,
+        "hf_overrides": hf_overrides,
+        "limit_mm_per_prompt": limit_mm_per_prompt,
+        "elapsed_s": total_elapsed,
+        "think_open_token_id": open_ids[0] if len(open_ids) == 1 else None,
+        "think_close_token_id": close_ids[0] if len(close_ids) == 1 else None,
+        "outputs": serialized_outputs,
+    }
+    Path(out_json_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
 def _is_vllm_engine_instance(obj: Any) -> bool:
@@ -491,109 +715,158 @@ def _generate_vllm(
     top_p: float = 0.95,
     recurrent_kv_cache_mode: Literal["per_loop", "last_loop"] = "per_loop",
     seed: int = 42,
+    subprocess_runner: Any | None = None,
+    fake_vllm: bool = False,
 ) -> list[Output]:
-    """vLLM generation backend (PR #60149) with `hf_overrides` for Dory and text-only init for Qwen3.5-4B."""
-    from vllm import LLM, SamplingParams  # type: ignore[import-not-found]
+    """vLLM generation backend (PR #60149).
 
+    Runs each vLLM engine invocation in an isolated subprocess that writes its outputs
+    to a temporary JSON file and exits so GPU VRAM is 100% released when the process ends.
+    """
+    # Support in-memory mock engine instances passed directly in unit tests
     if _is_vllm_engine_instance(vllm_engine_or_model_name):
+        from vllm import SamplingParams  # type: ignore[import-not-found]
+
         llm = vllm_engine_or_model_name
+        sampling_params = SamplingParams(
+            n=int(n_samples),
+            temperature=float(temperature),
+            top_p=float(top_p) if temperature > 1e-5 else 1.0,
+            max_tokens=int(max_new_tokens),
+            seed=int(seed),
+        )
+        t0 = time.perf_counter()
+        request_outputs = llm.generate(prompts, sampling_params)
+        total_elapsed = time.perf_counter() - t0
+        total_samples = max(1, len(prompts) * n_samples)
+        per_sample_latency = total_elapsed / total_samples
+
+        results_direct: list[Output] = []
+        for p_idx, req_out in enumerate(request_outputs):
+            ended_with_think = prompts[p_idx].rstrip().endswith(THINK_OPEN)
+            for sample in req_out.outputs:
+                gen_text = sample.text
+                sample_token_ids = (
+                    [int(t) for t in sample.token_ids]
+                    if hasattr(sample, "token_ids") and sample.token_ids is not None
+                    else None
+                )
+                n_total = (
+                    len(sample_token_ids)
+                    if sample_token_ids is not None
+                    else _count_tokens(gen_text, tokenizer)
+                )
+                cot_text, answer_text = split_cot_and_answer(
+                    gen_text, prompt_ended_with_think=ended_with_think
+                )
+                n_cot = count_cot_tokens(
+                    gen_text,
+                    tokenizer=tokenizer,
+                    token_ids=sample_token_ids,
+                    is_full_generation=True,
+                    prompt_ended_with_think=ended_with_think,
+                )
+                results_direct.append(
+                    Output(
+                        text=gen_text,
+                        cot_text=cot_text,
+                        answer_text=answer_text,
+                        n_cot_tokens=n_cot,
+                        n_total_tokens=n_total,
+                        latency_s=per_sample_latency,
+                        backend="vllm",
+                    )
+                )
+        return results_direct
+
+    evict_hf_models_from_gpu(vllm_engine_or_model_name)
+
+    if isinstance(vllm_engine_or_model_name, str):
+        model_name = vllm_engine_or_model_name
     else:
-        evict_hf_models_from_gpu(vllm_engine_or_model_name)
-        if isinstance(vllm_engine_or_model_name, str):
-            model_name = vllm_engine_or_model_name
-        else:
-            model_name = (
-                getattr(getattr(vllm_engine_or_model_name, "config", None), "_name_or_path", None)
-                or getattr(vllm_engine_or_model_name, "name_or_path", None)
-                or DORY_HF_REPO
+        model_name = (
+            getattr(getattr(vllm_engine_or_model_name, "config", None), "_name_or_path", None)
+            or getattr(vllm_engine_or_model_name, "name_or_path", None)
+            or DORY_HF_REPO
+        )
+        if n_loops is None:
+            n_loops = getattr(
+                getattr(vllm_engine_or_model_name, "config", None), "n_recurrent_loops", None
             )
-            if n_loops is None:
-                n_loops = getattr(
-                    getattr(vllm_engine_or_model_name, "config", None), "n_recurrent_loops", None
-                )
 
-        is_qwen = ("qwen" in model_name.lower()) or (model_name == QWEN_CONTROL_HF_REPO)
-        cache_key = (model_name, None if is_qwen else n_loops, recurrent_kv_cache_mode)
+    is_qwen = ("qwen" in model_name.lower()) or (model_name == QWEN_CONTROL_HF_REPO)
+    hf_overrides: dict[str, Any] = {}
+    limit_mm_per_prompt: dict[str, int] | None = None
+    if is_qwen:
+        limit_mm_per_prompt = {"image": 0, "video": 0}
+    elif n_loops is not None:
+        hf_overrides = build_dory_hf_overrides(
+            n_loops=int(n_loops),
+            recurrent_kv_cache_mode=recurrent_kv_cache_mode,
+        )
 
-        if _ACTIVE_VLLM_CACHE.get("engine") is not None and _ACTIVE_VLLM_CACHE.get("key") == cache_key:
-            llm = _ACTIVE_VLLM_CACHE["engine"]
-        else:
-            _shutdown_cached_vllm_engine()
-            evict_hf_models_from_gpu()
-            llm_kwargs: dict[str, Any] = {
-                "model": model_name,
-                "trust_remote_code": True,
-                "dtype": "bfloat16",
-                "seed": int(seed),
-            }
-            if is_qwen:
-                # Initialize Qwen/Qwen3.5-4B in text-only mode (disable multimodal vision/video profiling)
-                llm_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
-            elif n_loops is not None:
-                llm_kwargs["hf_overrides"] = build_dory_hf_overrides(
-                    n_loops=int(n_loops),
-                    recurrent_kv_cache_mode=recurrent_kv_cache_mode,
-                )
-            llm = LLM(**llm_kwargs)
-            _ACTIVE_VLLM_CACHE["key"] = cache_key
-            _ACTIVE_VLLM_CACHE["engine"] = llm
+    request_payload = {
+        "mode": "generate",
+        "model_name": model_name,
+        "prompts": prompts,
+        "max_new_tokens": int(max_new_tokens),
+        "temperature": float(temperature),
+        "top_p": float(top_p) if temperature > 1e-5 else 1.0,
+        "n_samples": int(n_samples),
+        "seed": int(seed),
+        "n_loops": int(n_loops) if (n_loops is not None and not is_qwen) else None,
+        "hf_overrides": hf_overrides,
+        "limit_mm_per_prompt": limit_mm_per_prompt,
+        "fake_vllm": bool(fake_vllm),
+    }
 
-    if tokenizer is None and hasattr(llm, "get_tokenizer"):
-        try:
-            tokenizer = llm.get_tokenizer()
-        except Exception:
-            pass
-
-    sampling_params = SamplingParams(
-        n=int(n_samples),
-        temperature=float(temperature),
-        top_p=float(top_p) if temperature > 1e-5 else 1.0,
-        max_tokens=int(max_new_tokens),
-        seed=int(seed),
+    worker_data = run_vllm_in_subprocess(
+        request_payload,
+        subprocess_runner=subprocess_runner,
     )
 
-    t0 = time.perf_counter()
-    request_outputs = llm.generate(prompts, sampling_params)
-    total_elapsed = time.perf_counter() - t0
-    total_samples = max(1, len(prompts) * n_samples)
+    total_elapsed = float(worker_data.get("elapsed_s", 0.0))
+    raw_outputs: list[dict[str, Any]] = list(worker_data.get("outputs", []))
+    total_samples = max(1, len(raw_outputs))
     per_sample_latency = total_elapsed / total_samples
+    think_open_id = worker_data.get("think_open_token_id")
+    think_close_id = worker_data.get("think_close_token_id")
 
     results: list[Output] = []
-    for p_idx, req_out in enumerate(request_outputs):
-        ended_with_think = prompts[p_idx].rstrip().endswith(THINK_OPEN)
-        for sample in req_out.outputs:
-            gen_text = sample.text
-            sample_token_ids = (
-                [int(t) for t in sample.token_ids]
-                if hasattr(sample, "token_ids") and sample.token_ids is not None
-                else None
+    for item in raw_outputs:
+        p_idx = int(item.get("prompt_idx", 0))
+        ended_with_think = prompts[p_idx].rstrip().endswith(THINK_OPEN) if p_idx < len(prompts) else False
+        gen_text = str(item.get("text", ""))
+        raw_ids = item.get("token_ids")
+        sample_token_ids = [int(t) for t in raw_ids] if isinstance(raw_ids, list) else None
+        n_total = (
+            len(sample_token_ids)
+            if sample_token_ids is not None
+            else _count_tokens(gen_text, tokenizer)
+        )
+        cot_text, answer_text = split_cot_and_answer(
+            gen_text, prompt_ended_with_think=ended_with_think
+        )
+        n_cot = count_cot_tokens(
+            gen_text,
+            tokenizer=tokenizer,
+            token_ids=sample_token_ids,
+            think_open_token_id=think_open_id,
+            think_close_token_id=think_close_id,
+            is_full_generation=True,
+            prompt_ended_with_think=ended_with_think,
+        )
+        results.append(
+            Output(
+                text=gen_text,
+                cot_text=cot_text,
+                answer_text=answer_text,
+                n_cot_tokens=n_cot,
+                n_total_tokens=n_total,
+                latency_s=per_sample_latency,
+                backend="vllm",
             )
-            n_total = (
-                len(sample_token_ids)
-                if sample_token_ids is not None
-                else _count_tokens(gen_text, tokenizer)
-            )
-            cot_text, answer_text = split_cot_and_answer(
-                gen_text, prompt_ended_with_think=ended_with_think
-            )
-            n_cot = count_cot_tokens(
-                gen_text,
-                tokenizer=tokenizer,
-                token_ids=sample_token_ids,
-                is_full_generation=True,
-                prompt_ended_with_think=ended_with_think,
-            )
-            results.append(
-                Output(
-                    text=gen_text,
-                    cot_text=cot_text,
-                    answer_text=answer_text,
-                    n_cot_tokens=n_cot,
-                    n_total_tokens=n_total,
-                    latency_s=per_sample_latency,
-                    backend="vllm",
-                )
-            )
+        )
     return results
 
 
@@ -612,6 +885,8 @@ def generate(
     batch_size: int = 4,
     top_p: float = 0.95,
     seed: int = 42,
+    subprocess_runner: Any | None = None,
+    fake_vllm: bool = False,
 ) -> list[Output]:
     """Unified generation wrapper across all notebooks and benchmarks (Section 1.3).
 
@@ -656,6 +931,8 @@ def generate(
                 top_p=top_p,
                 recurrent_kv_cache_mode=recurrent_kv_cache_mode,
                 seed=seed,
+                subprocess_runner=subprocess_runner,
+                fake_vllm=fake_vllm,
             )
         except Exception as exc:
             if not allow_hf_fallback:
@@ -685,3 +962,8 @@ def generate(
         batch_size=batch_size,
         top_p=top_p,
     )
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--vllm-worker":
+        _vllm_subprocess_worker_main(sys.argv[2], sys.argv[3])
