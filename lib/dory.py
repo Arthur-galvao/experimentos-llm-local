@@ -54,7 +54,7 @@ except ImportError:  # pragma: no cover
     nn = _DummyNN()  # type: ignore[assignment]
 
 DORY_HF_REPO = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
-NANBEIGE_HF_REPO = "Nanbeige/Nanbeige4.2-3B"
+QWEN_CONTROL_HF_REPO = "Qwen/Qwen3.5-4B"
 
 
 def justnorm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -130,7 +130,8 @@ class DoryConfig(PretrainedConfig):
         sliding_window: int = 1024,
         layer_types: list[str] | None = None,
         rope_parameters: dict[str, Any] | None = None,
-        kv_cache_mode: Literal["per_loop", "last_loop"] = "per_loop",
+        recurrent_kv_cache_mode: Literal["per_loop", "last_loop"] = "per_loop",
+        kv_cache_mode: Literal["per_loop", "last_loop"] | None = None,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         pad_token_id: int = 0,
@@ -179,7 +180,11 @@ class DoryConfig(PretrainedConfig):
                 "partial_rotary_factor": 1.0,
             },
         }
-        self.kv_cache_mode: Literal["per_loop", "last_loop"] = kv_cache_mode
+        resolved_kv_mode: Literal["per_loop", "last_loop"] = (
+            kv_cache_mode if kv_cache_mode is not None else recurrent_kv_cache_mode
+        )
+        self.recurrent_kv_cache_mode: Literal["per_loop", "last_loop"] = resolved_kv_mode
+        self.kv_cache_mode: Literal["per_loop", "last_loop"] = resolved_kv_mode
 
 
 class DoryLoopCache:

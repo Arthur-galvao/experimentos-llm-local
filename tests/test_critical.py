@@ -25,7 +25,13 @@ from lib.dory import (
     set_dory_loops,
 )
 from lib.evals import build_lcb_quick_split
-from lib.gen import count_cot_tokens, generate, split_cot_and_answer
+from lib.gen import (
+    DORY_VLLM_OVERRIDE_KEYS,
+    build_dory_hf_overrides,
+    count_cot_tokens,
+    generate,
+    split_cot_and_answer,
+)
 from lib.hw import detect_hardware_profile, get_hw_config
 from lib.io import CheckpointManager, ResumableProgress
 from lib.metrics import check_phase_gate, compute_pareto_frontier, plot_pareto
@@ -552,6 +558,106 @@ def test_hw_config_and_lcb_quick_split() -> None:
         assert [x["question_id"] for x in split] == ["q_14", "q_13", "q_12", "q_11", "q_10"]
 
 
+# ==============================================================================
+# 9. New Mandatory Tests: hf_overrides keys, exact token_ids CoT count, allow_hf_fallback
+# ==============================================================================
+def test_hf_overrides_keys_match_dory_config() -> None:
+    cfg = DoryConfig()
+    cfg_dict = cfg.__dict__
+    overrides = build_dory_hf_overrides(n_loops=4, recurrent_kv_cache_mode="per_loop")
+
+    assert tuple(overrides.keys()) == DORY_VLLM_OVERRIDE_KEYS
+    assert set(overrides.keys()) == {"n_recurrent_loops", "recurrent_kv_cache_mode"}
+    for key in overrides:
+        assert hasattr(cfg, key) and key in cfg_dict, (
+            f"Chave '{key}' de hf_overrides não existe nos campos do DoryConfig/config.json!"
+        )
+    assert overrides["n_recurrent_loops"] == 4
+    assert overrides["recurrent_kv_cache_mode"] == "per_loop"
+
+
+def test_cot_token_counting_exact_from_token_ids() -> None:
+    tokenizer = DeterministicWordTokenizer()
+    think_open_id = tokenizer.convert_tokens_to_ids("<think>")
+    think_close_id = tokenizer.convert_tokens_to_ids("</think>")
+
+    # Skewed text where CoT has 3 tokens (very short text) and answer has 2 tokens (very long text):
+    # A character-ratio heuristic would estimate ~1 CoT token instead of the exact 3 tokens.
+    skewed_text = "<think> a b x </think> " + ("super_long_identifier_name " * 40).strip()
+    exact_token_ids = [
+        think_open_id,
+        tokenizer.convert_tokens_to_ids("a"),
+        tokenizer.convert_tokens_to_ids("b"),
+        tokenizer.convert_tokens_to_ids("x"),
+        think_close_id,
+        tokenizer.convert_tokens_to_ids("return"),
+        tokenizer.convert_tokens_to_ids("sum"),
+    ]
+
+    n_cot = count_cot_tokens(
+        skewed_text,
+        tokenizer=tokenizer,
+        token_ids=exact_token_ids,
+        is_full_generation=True,
+    )
+    assert n_cot == 3
+
+    # Case where <think> was already in the prompt (prompt_ended_with_think=True): 4 tokens before </think>
+    ids_without_open = [
+        tokenizer.convert_tokens_to_ids("step"),
+        tokenizer.convert_tokens_to_ids("1"),
+        tokenizer.convert_tokens_to_ids("add"),
+        tokenizer.convert_tokens_to_ids("a"),
+        think_close_id,
+        tokenizer.convert_tokens_to_ids("return"),
+    ]
+    n_cot_no_open = count_cot_tokens(
+        "step 1 add a </think> " + ("long_answer_padding " * 50),
+        tokenizer=tokenizer,
+        token_ids=ids_without_open,
+        is_full_generation=True,
+        prompt_ended_with_think=True,
+    )
+    assert n_cot_no_open == 4
+
+
+def test_vllm_failure_raises_when_allow_hf_fallback_false() -> None:
+    tokenizer = DeterministicWordTokenizer()
+
+    class FailingMockVLLMEngine:
+        def generate(self, prompts: list[str], sampling_params: Any) -> Any:
+            raise RuntimeError("Simulated vLLM engine failure")
+
+    # 1. allow_hf_fallback=False (default) must raise when vLLM fails
+    raised = False
+    try:
+        generate(
+            FailingMockVLLMEngine(),
+            ["Solve x"],
+            tokenizer=tokenizer,
+            backend="vllm",
+            allow_hf_fallback=False,
+        )
+    except RuntimeError:
+        raised = True
+    assert raised is True, "generate(..., backend='vllm', allow_hf_fallback=False) deve levantar erro!"
+
+    # 2. allow_hf_fallback=True falls back to HF and records backend='hf'
+    def mock_hf_callable(prompt: str, **kwargs: Any) -> str:
+        return "<think> step 1 </think> return x"
+
+    fallback_outs = generate(
+        mock_hf_callable,
+        ["Solve x"],
+        tokenizer=tokenizer,
+        backend="vllm",
+        allow_hf_fallback=True,
+    )
+    assert len(fallback_outs) == 1
+    assert fallback_outs[0].backend == "hf"
+    assert fallback_outs[0].n_cot_tokens == 2
+
+
 class CriticalModulesTestSuite(unittest.TestCase):
     """Unittest wrapper so tests can also be run via `python -m unittest` if pytest is absent."""
 
@@ -578,6 +684,15 @@ class CriticalModulesTestSuite(unittest.TestCase):
 
     def test_8_hw_config_and_lcb_quick_split(self) -> None:
         test_hw_config_and_lcb_quick_split()
+
+    def test_9_hf_overrides_keys_match_dory_config(self) -> None:
+        test_hf_overrides_keys_match_dory_config()
+
+    def test_10_cot_token_counting_exact_from_token_ids(self) -> None:
+        test_cot_token_counting_exact_from_token_ids()
+
+    def test_11_vllm_failure_raises_when_allow_hf_fallback_false(self) -> None:
+        test_vllm_failure_raises_when_allow_hf_fallback_false()
 
 
 if __name__ == "__main__":

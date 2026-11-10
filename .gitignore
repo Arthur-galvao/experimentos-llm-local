@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Dados, resultados e checkpoints (ficam no Google Drive)
+results/
+data/
+checkpoints/
+
+# Pesos de modelo
+*.safetensors
+*.bin
+*.gguf
+
+# Segredos
+.env
