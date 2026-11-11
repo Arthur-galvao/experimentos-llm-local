@@ -586,8 +586,16 @@ def _vllm_subprocess_worker_main(in_json_path: str, out_json_path: str) -> None:
         llm_kwargs["hf_overrides"] = hf_overrides
     if req.get("gpu_memory_utilization") is not None:
         llm_kwargs["gpu_memory_utilization"] = float(req["gpu_memory_utilization"])
+    elif mode != "equivalence":
+        # Avaliação: o processo só tem o vLLM na GPU, então ele pode usar quase toda a VRAM.
+        llm_kwargs["gpu_memory_utilization"] = 0.90
     if req.get("max_model_len") is not None:
         llm_kwargs["max_model_len"] = int(req["max_model_len"])
+    elif mode != "equivalence":
+        # Sem isto o vLLM usa o contexto máximo do modelo (256K) e exige cache KV para uma
+        # sequência desse tamanho, o que não cabe na GPU ("max seq len ... KV cache is needed").
+        # Prompt (até ~4K tokens, ex.: SciCode) + max_new_tokens.
+        llm_kwargs["max_model_len"] = int(max_new_tokens) + 4096
 
     llm = LLM(**llm_kwargs)
 
