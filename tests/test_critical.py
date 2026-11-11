@@ -283,6 +283,13 @@ def test_reward_synthetic_cases() -> None:
     # Ordering: correct/short > correct/long > wrong
     assert r_short.total_reward > r_long.total_reward > r_wrong.total_reward
 
+    # CoT truncada com código correto dentro do raciocínio: não passa (senão o GRPO premia truncar)
+    truncated = "add a and b ```python\ndef add(a, b):\n    return a + b\n```"  # <think> veio no prompt
+    r_trunc = compute_reward(
+        truncated, test_code=test_suite, tokenizer=tokenizer, lam=0.1, l_ref=100.0, prompt_ended_with_think=True
+    )
+    assert r_trunc.passed_tests is False
+
     # Also verify GRPOTrainer wrapper function
     grpo_fn = make_grpo_reward_fn(tokenizer=tokenizer, lam=0.1, l_ref=100.0, format_bonus_val=0.05)
     batch_rewards = grpo_fn(
@@ -1800,10 +1807,12 @@ def test_truncated_fraction_is_recorded_and_not_confused_with_closed_think() -> 
                     pass
 
                 s = _S()
-                if i % 2 == 0:  # truncada: gastou todo o orçamento no raciocínio, sem </think>
-                    s.text, s.token_ids = "<think> step 1 step 1 step 1", [3, 5, 6, 5, 6, 5, 6, 5]
+                code = "```python\ndef f():\n    return 1\n```"
+                # O prompt já termina em <think> (como nos templates reais), então o texto gerado não tem <think>.
+                if i % 2 == 0:  # truncada: rascunho correto DENTRO da CoT, sem </think> -> tem que ser erro
+                    s.text, s.token_ids = f"step 1 {code}", [5, 6, 5, 6, 5, 6, 5, 6]
                 else:  # terminou no limite, mas fechou </think>: NÃO é truncada
-                    s.text, s.token_ids = "<think> step 1 </think> ok", [3, 5, 6, 4, 25, 26, 25, 26]
+                    s.text, s.token_ids = f"step 1 </think> {code}", [5, 6, 4, 25, 26, 25, 26, 25]
                 r = _S()
                 r.outputs = [s]
                 outs.append(r)
@@ -1817,7 +1826,7 @@ def test_truncated_fraction_is_recorded_and_not_confused_with_closed_think() -> 
     fake.SamplingParams = _FakeSP  # type: ignore[attr-defined]
     with tempfile.TemporaryDirectory() as tmp, _mock.patch.dict(_sys.modules, {"vllm": fake}):
         res_path = Path(tmp) / "results.jsonl"
-        problems = [{"task_id": f"t{i}", "prompt": "x", "test_code": None, "entry_point": None} for i in range(4)]
+        problems = [{"task_id": f"t{i}", "prompt": "x", "test_code": "assert f() == 1", "entry_point": None} for i in range(4)]
         common = dict(
             problems=problems, model=Engine(), tokenizer=DeterministicWordTokenizer(), run_id="trunc", phase="F0",
             model_name="m", checkpoint="base", n_loops=2, eval_tier="quick", bench_name="b",
@@ -1826,6 +1835,7 @@ def test_truncated_fraction_is_recorded_and_not_confused_with_closed_think() -> 
         )
         full = _run_problems_loop(smoke=False, **common)
         assert full["config"]["truncated_frac"] == 0.5 and full["config"]["n_truncated"] == 2
+        assert full["pass1"] == 0.5  # só as fechadas passam; o rascunho da CoT truncada não conta
         assert load_results(res_path)[-1]["config"]["truncated_frac"] == 0.5
         smoke = _run_problems_loop(smoke=True, **{**common, "run_id": "trunc_s"})
         assert smoke["truncated_frac"] == 0.5 and smoke["config"]["truncated_frac"] == 0.5

@@ -79,7 +79,8 @@ def compute_reward(
         n_cot_tokens = _count_tokens(cot_text, tokenizer)
 
     if passed_tests is None:
-        candidate_for_sandbox = answer_text if answer_text.strip() else completion_text
+        # CoT truncada (resposta vazia) vale 0; avaliar rascunho da CoT premiaria o truncamento no GRPO.
+        candidate_for_sandbox = answer_text
         sandbox_res = check_solution(
             candidate_for_sandbox,
             test_code=test_code,

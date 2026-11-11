@@ -362,7 +362,8 @@ def _run_problems_loop(
             seed=seed,
         )
         for prob, out in zip(batch, outputs):
-            candidate = out.answer_text if out.answer_text.strip() else out.text
+            # Só a resposta pós-</think> conta; CoT truncada (resposta vazia) é erro, nunca rascunho da CoT.
+            candidate = out.answer_text
             extra_fields: dict[str, Any] = {}
             if prob.get("grader") is not None:
                 sb, extra_fields = prob["grader"](candidate, progress.get)
