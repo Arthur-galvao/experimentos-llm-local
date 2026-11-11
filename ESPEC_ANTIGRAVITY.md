@@ -7,12 +7,12 @@
 ## 0. Regras para o agente
 
 1. **Não invente APIs.** O Dory usa código próprio (`trust_remote_code=True`). Antes de usar qualquer parâmetro de loop, cache ou forward, **abra e leia** o `modeling_*.py` e o `config.json` do repositório no Hub. Campos conhecidos no config: `n_recurrent_loops`, `n_input_layers`, `n_recurrent_layers`, `n_output_layers`, `recurrent_kv_cache_mode`, `vocab_size=131072`, `hidden_size=2560`, `tie_word_embeddings=false`. Confirme como mudar o número de loops na inferência (argumento do forward/generate ou config) e documente no `lib/dory.py`.
-2. **Versões:** não fixe `transformers`, `safetensors`, `tokenizers` nem `huggingface_hub`. O vLLM da PR (`#60149`) exige `transformers>=5.16.1,<5.21` e instala as próprias versões compatíveis. Instale o vLLM primeiro e só adicione por cima pacotes que não conflitem com ele: `accelerate`, `datasets`, `evalplus`, `matplotlib`, `pytest`, e `trl`/`peft` em versões compatíveis com `transformers` 5.x. Imprima as versões de `transformers` e `vllm` logo após a instalação.
+2. **Versões:** instale primeiro o vLLM da PR (`#60149`), sem fixar `transformers`, `safetensors`, `tokenizers` ou `huggingface_hub` (ele exige `transformers>=5.16.1,<5.21` e instala as próprias versões compatíveis). Por cima, instale só pacotes compatíveis: `accelerate`, `datasets`, `evalplus`, `matplotlib`, `pytest`, e `trl`/`peft` em versões que suportem `transformers` 5.x. Imprima as versões de `transformers` e `vllm` logo após a instalação.
 3. **Todo notebook é retomável.** O Colab desconecta. Checkpoints e resultados vão para o Google Drive. Ao reiniciar, o notebook detecta o último checkpoint e continua de onde parou.
 4. **Smoke test antes da corrida real.** Toda tarefa de treino ou avaliação tem uma célula `SMOKE=True` que roda com ~5 exemplos e poucos passos, para validar o pipeline antes de gastar compute.
 5. **Célula de estimativa de custo.** Antes da corrida real, estime o tempo (exemplos × tempo medido no smoke) e as compute units (A100 ≈ 11–13 CU/h, confirmar no painel).
 6. **Seeds fixas** e config de cada execução serializado no registro de resultados.
-7. **Nada de código duplicado entre notebooks.** Lógica compartilhada fica em `lib/`.
+7. **Notebooks finos e nada de código duplicado:** lógica compartilhada fica em `lib/` e a lógica executável em `scripts/`. Os notebooks (como `F0_setup_baseline.ipynb`) têm apenas a célula 0 (Drive + `git clone`/`git pull`), instalação e chamadas `!python scripts/...`. Todo script em `scripts/` deve ter `main()` + `if __name__ == "__main__":` e nenhum código solto no nível do módulo (pois o vLLM usa `spawn` e reimporta o arquivo).
 
 ---
 
@@ -32,19 +32,23 @@
 | Embeddings novos (F3) | full FT | LoRA + `modules_to_save=["embed_tokens","lm_head"]` |
 | Coconut (F4) | LoRA + gradient checkpointing, poucos pensamentos | provavelmente inviável; avisar |
 
-### 1.2 Persistência
-- Montar o Drive em `/content/drive`. Raiz do projeto: `/content/drive/MyDrive/coder-comprimido/`.
-- Pesos base em cache no Drive (`HF_HOME` apontando para o Drive) para não baixar 8GB a cada sessão.
+### 1.2 Persistência e Cache Local
+- Montar o Drive em `/content/drive`. Raiz de artefatos persistentes (`checkpoints`, `eval_cache`, `results`, `data`): `/content/drive/MyDrive/coder-comprimido/`.
+- **Cache do Hugging Face sempre no disco local (`/root/.cache/huggingface`):** `setup_drive_and_cache` em `lib/io.py` **nunca** deve apontar `HF_HOME`, `HF_HUB_CACHE` ou `HF_DATASETS_CACHE` para `/content/drive` (o Drive corrompia `tokenizer.json`). `hf_cache` é removido dos caminhos.
+- **Validação de integridade (`ensure_model_files(repo)` em `lib/io.py`):** valida `config.json`, `tokenizer_config.json` e `tokenizer.json` com `json.load` e baixa novamente com `force_download=True` caso algum esteja corrompido.
 - Checkpoints a cada N passos (padrão: 15 min de treino), mantendo os 2 últimos.
 
-### 1.3 Backend de geração
-- `lib/gen.py` com interface única: `generate(model, prompts, max_new_tokens, temperature, n_loops, n_samples) -> list[Output]`, onde `Output` tem `text`, `cot_text`, `answer_text`, `n_cot_tokens`, `n_total_tokens`, `latency_s`.
-- **Backend principal de avaliação: vLLM da PR oficial** (`VLLM_USE_PRECOMPILED=1 pip install "git+https://github.com/vllm-project/vllm.git@refs/pull/60149/head"`), com loops definidos via `hf_overrides={"n_recurrent_loops": k}`.
+### 1.3 Backend de geração, isolamento de processos e notebooks finos
+- `lib/gen.py` com interface única: `generate(model, prompts, max_new_tokens, temperature, n_loops, n_samples) -> list[Output]`, onde `Output` tem `text`, `cot_text`, `answer_text`, `n_cot_tokens`, `n_total_tokens`, `latency_s`, `backend`.
+- **Backend principal de avaliação: vLLM da PR oficial** (`VLLM_USE_PRECOMPILED=1 pip install "git+https://github.com/vllm-project/vllm.git@refs/pull/60149/head"`), com loops definidos via `hf_overrides={"n_recurrent_loops": k, "recurrent_kv_cache_mode": mode}`.
+- **Lotes grandes no vLLM:** com `backend="vllm"`, enviar os problemas pendentes em lotes de 128 (`VLLM_EVAL_BATCH_SIZE = 128`), gravando checkpoint em `eval_cache` a cada lote, em vez de usar o `batch_size` do HF.
 - **Backend HF** (`lib/dory.py`): usado para treino, logit lens e testes curtos. É PyTorch puro, lento demais para gerar 16 mil tokens em centenas de problemas.
 - **Sem troca silenciosa:** cada saída registra o backend **efetivamente usado** (`vllm` ou `hf`), e o `results.jsonl` grava esse valor. Com `smoke=False`, uma falha do vLLM **interrompe** a execução (`allow_hf_fallback=False` por padrão). O fallback para HF só é permitido em smoke test.
-- **Memória:** antes de criar um motor vLLM, tire qualquer modelo HF da GPU. Se recriar o motor (para mudar o número de loops) vazar memória, rode cada configuração num subprocesso.
+- **Um processo por motor vLLM:** antes de criar um motor vLLM, tire qualquer modelo HF da GPU. Cada baseline do F0 (Dory L1, L2, L4 e Qwen) roda num subprocesso separado chamando um script de `scripts/`, garantindo liberação de 100% da VRAM quando o processo termina. Todo script em `scripts/` tem `main()` + `if __name__ == "__main__":` e nenhum código solto no nível do módulo (o vLLM usa `spawn` e reimporta o arquivo).
+- **Notebooks finos:** toda a lógica fica em `lib/` e `scripts/`. O `F0_setup_baseline.ipynb` tem apenas a célula 0 (Drive + `git pull`), instalação e chamadas `!python scripts/...`.
+- **Alinhamento de Tokenizer (`fix_mistral_regex`):** comparar a tokenização de 20 textos (código, inglês, espaços e quebras de linha) entre o tokenizer HF e o tokenizer do vLLM; se divergirem, usar `fix_mistral_regex=True` onde necessário para que produzam exatamente os mesmos IDs.
 - **Referência oficial do modelo:** `hf://models/tiny-random/dory-1.0/vllm_dory.py` (cópia do código da PR do vLLM). Qualquer mudança em `lib/dory.py` precisa continuar batendo com ele.
-- Separar CoT e resposta pelos delimitadores de raciocínio do chat template de cada modelo (verificar no `tokenizer_config.json`).
+- Separar CoT e resposta pelos delimitadores de raciocínio do chat template de cada modelo (verificar no `tokenizer_config.json`), contando tokens de CoT exatamente pelos `token_ids` até `</think>`.
 
 ---
 

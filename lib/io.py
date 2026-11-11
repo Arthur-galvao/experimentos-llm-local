@@ -32,10 +32,10 @@ def setup_drive_and_cache(
 
     Returns a dictionary of resolved directory paths:
         - root: base persistent directory
-        - hf_home: HuggingFace local cache dir (`/root/.cache/huggingface`)
         - checkpoints: model/training checkpoints dir
         - eval_cache: per-problem evaluation resume cache dir
         - results: results dir (containing results.jsonl and plots/)
+        - plots: plots dir
         - data: dataset splits dir (containing lcb_quick.json)
     """
     if is_colab():
@@ -50,19 +50,19 @@ def setup_drive_and_cache(
         else:
             base_dir = Path.cwd().resolve()
 
-    hf_home = Path(DEFAULT_LOCAL_HF_HOME)
     checkpoints_dir = base_dir / "checkpoints"
     eval_cache_dir = base_dir / "eval_cache"
     results_dir = base_dir / "results"
     plots_dir = results_dir / "plots"
     data_dir = base_dir / "data"
 
+    # Remove stale corrupted hf_cache on Drive if present
+    stale_hf_cache = base_dir / "hf_cache"
+    if stale_hf_cache.exists():
+        shutil.rmtree(stale_hf_cache, ignore_errors=True)
+
     for d in (base_dir, checkpoints_dir, eval_cache_dir, results_dir, plots_dir, data_dir):
         d.mkdir(parents=True, exist_ok=True)
-    try:
-        hf_home.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
 
     os.environ["HF_HOME"] = DEFAULT_LOCAL_HF_HOME
     os.environ["HF_HUB_CACHE"] = f"{DEFAULT_LOCAL_HF_HOME}/hub"
@@ -70,13 +70,42 @@ def setup_drive_and_cache(
 
     return {
         "root": base_dir,
-        "hf_home": hf_home,
         "checkpoints": checkpoints_dir,
         "eval_cache": eval_cache_dir,
         "results": results_dir,
         "plots": plots_dir,
         "data": data_dir,
     }
+
+
+def ensure_model_files(
+    repo: str,
+    *,
+    files: tuple[str, ...] = ("config.json", "tokenizer_config.json", "tokenizer.json"),
+    download_fn: Any | None = None,
+) -> dict[str, Path]:
+    """Validate `config.json`, `tokenizer_config.json`, and `tokenizer.json` with `json.load`
+    and re-download with `force_download=True` if any file is corrupted.
+    """
+    if download_fn is None:
+        from huggingface_hub import hf_hub_download  # type: ignore[import-not-found]
+
+        download_fn = hf_hub_download
+
+    verified_paths: dict[str, Path] = {}
+    for fname in files:
+        local_path = Path(download_fn(repo, fname))
+        try:
+            with local_path.open("r", encoding="utf-8") as f:
+                json.load(f)
+        except Exception:
+            print(f"[ensure_model_files] Arquivo corrompido detectado ({repo}/{fname}) -> baixando com force_download=True")
+            local_path = Path(download_fn(repo, fname, force_download=True))
+            with local_path.open("r", encoding="utf-8") as f:
+                json.load(f)
+        verified_paths[fname] = local_path
+
+    return verified_paths
 
 
 class CheckpointManager:

@@ -3,8 +3,10 @@
 from .hw import PROFILE, detect_hardware_profile, get_hw_config, print_hardware_summary
 from .io import (
     DEFAULT_DRIVE_ROOT,
+    DEFAULT_LOCAL_HF_HOME,
     CheckpointManager,
     ResumableProgress,
+    ensure_model_files,
     setup_drive_and_cache,
 )
 from .registry import (
@@ -24,14 +26,17 @@ from .metrics import (
 from .dory import (
     DORY_HF_REPO,
     QWEN_CONTROL_HF_REPO,
+    TOKENIZER_TEST_TEXTS,
     DoryConfig,
     DoryForCausalLM,
     DoryModel,
     init_new_tokens_embeddings,
     load_dory,
+    load_dory_tokenizer,
     logit_lens_per_loop,
     register_dory_auto,
     set_dory_loops,
+    verify_tokenizer_equivalence,
     verify_vllm_hf_equivalence,
 )
 from .gen import (
@@ -57,6 +62,7 @@ from .rewards import (
     make_grpo_reward_fn,
 )
 from .evals import (
+    VLLM_EVAL_BATCH_SIZE,
     build_lcb_quick_split,
     eval_gate,
     eval_humaneval_plus,
@@ -73,8 +79,10 @@ __all__ = [
     "get_hw_config",
     "print_hardware_summary",
     "DEFAULT_DRIVE_ROOT",
+    "DEFAULT_LOCAL_HF_HOME",
     "CheckpointManager",
     "ResumableProgress",
+    "ensure_model_files",
     "setup_drive_and_cache",
     "RESULT_FIELDS",
     "append_result",
@@ -88,14 +96,17 @@ __all__ = [
     "plot_pareto",
     "DORY_HF_REPO",
     "QWEN_CONTROL_HF_REPO",
+    "TOKENIZER_TEST_TEXTS",
     "DoryConfig",
     "DoryForCausalLM",
     "DoryModel",
     "init_new_tokens_embeddings",
     "load_dory",
+    "load_dory_tokenizer",
     "logit_lens_per_loop",
     "register_dory_auto",
     "set_dory_loops",
+    "verify_tokenizer_equivalence",
     "verify_vllm_hf_equivalence",
     "DORY_VLLM_OVERRIDE_KEYS",
     "Output",
@@ -113,6 +124,7 @@ __all__ = [
     "RewardBreakdown",
     "compute_reward",
     "make_grpo_reward_fn",
+    "VLLM_EVAL_BATCH_SIZE",
     "build_lcb_quick_split",
     "eval_gate",
     "eval_humaneval_plus",

@@ -703,6 +703,52 @@ def _is_vllm_engine_instance(obj: Any) -> bool:
     return hasattr(obj, "generate")
 
 
+_CACHED_VLLM_ENGINE: tuple[tuple[Any, ...], Any] | None = None
+
+
+def _get_or_create_vllm_engine(
+    model_name: str,
+    *,
+    n_loops: int | None,
+    recurrent_kv_cache_mode: str,
+    hf_overrides: dict[str, Any],
+    limit_mm_per_prompt: dict[str, int] | None,
+    seed: int,
+) -> Any:
+    """Return a cached in-process `vllm.LLM` instance for `(model_name, n_loops, recurrent_kv_cache_mode)`
+    so multiple batches of 128 problems within the same single-engine baseline subprocess reuse the engine.
+    """
+    global _CACHED_VLLM_ENGINE
+    import gc
+    from vllm import LLM  # type: ignore[import-not-found]
+
+    engine_key = (model_name, n_loops, recurrent_kv_cache_mode)
+    if _CACHED_VLLM_ENGINE is not None:
+        cached_key, cached_llm = _CACHED_VLLM_ENGINE
+        if cached_key == engine_key:
+            return cached_llm
+        del cached_llm
+        _CACHED_VLLM_ENGINE = None
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    llm_kwargs: dict[str, Any] = {
+        "model": model_name,
+        "trust_remote_code": True,
+        "dtype": "bfloat16",
+        "seed": int(seed),
+    }
+    if limit_mm_per_prompt is not None:
+        llm_kwargs["limit_mm_per_prompt"] = limit_mm_per_prompt
+    if hf_overrides:
+        llm_kwargs["hf_overrides"] = hf_overrides
+
+    llm = LLM(**llm_kwargs)
+    _CACHED_VLLM_ENGINE = (engine_key, llm)
+    return llm
+
+
 def _generate_vllm(
     vllm_engine_or_model_name: Any,
     prompts: list[str],
@@ -720,14 +766,55 @@ def _generate_vllm(
 ) -> list[Output]:
     """vLLM generation backend (PR #60149).
 
-    Runs each vLLM engine invocation in an isolated subprocess that writes its outputs
-    to a temporary JSON file and exits so GPU VRAM is 100% released when the process ends.
+    In production (`scripts/`), each vLLM engine configuration (Dory L1, L2, L4, Qwen) runs in its
+    own dedicated script subprocess and reuses the loaded `LLM` instance across batches of 128.
     """
-    # Support in-memory mock engine instances passed directly in unit tests
-    if _is_vllm_engine_instance(vllm_engine_or_model_name):
+    # Support in-memory engine instances or normal in-process execution when not using fake_vllm/subprocess_runner
+    if _is_vllm_engine_instance(vllm_engine_or_model_name) or (subprocess_runner is None and not fake_vllm):
         from vllm import SamplingParams  # type: ignore[import-not-found]
 
-        llm = vllm_engine_or_model_name
+        if _is_vllm_engine_instance(vllm_engine_or_model_name):
+            llm = vllm_engine_or_model_name
+        else:
+            evict_hf_models_from_gpu(vllm_engine_or_model_name)
+            if isinstance(vllm_engine_or_model_name, str):
+                model_name = vllm_engine_or_model_name
+            else:
+                model_name = (
+                    getattr(getattr(vllm_engine_or_model_name, "config", None), "_name_or_path", None)
+                    or getattr(vllm_engine_or_model_name, "name_or_path", None)
+                    or DORY_HF_REPO
+                )
+                if n_loops is None:
+                    n_loops = getattr(
+                        getattr(vllm_engine_or_model_name, "config", None), "n_recurrent_loops", None
+                    )
+            is_qwen = ("qwen" in model_name.lower()) or (model_name == QWEN_CONTROL_HF_REPO)
+            hf_overrides_inproc: dict[str, Any] = {}
+            limit_mm_inproc: dict[str, int] | None = None
+            if is_qwen:
+                limit_mm_inproc = {"image": 0, "video": 0}
+            elif n_loops is not None:
+                hf_overrides_inproc = build_dory_hf_overrides(
+                    n_loops=int(n_loops),
+                    recurrent_kv_cache_mode=recurrent_kv_cache_mode,
+                )
+            llm = _get_or_create_vllm_engine(
+                model_name,
+                n_loops=int(n_loops) if (n_loops is not None and not is_qwen) else None,
+                recurrent_kv_cache_mode=recurrent_kv_cache_mode,
+                hf_overrides=hf_overrides_inproc,
+                limit_mm_per_prompt=limit_mm_inproc,
+                seed=seed,
+            )
+
+        tok_for_cot = tokenizer
+        if tok_for_cot is None and hasattr(llm, "get_tokenizer"):
+            try:
+                tok_for_cot = llm.get_tokenizer()
+            except Exception:
+                tok_for_cot = None
+
         sampling_params = SamplingParams(
             n=int(n_samples),
             temperature=float(temperature),
@@ -754,14 +841,14 @@ def _generate_vllm(
                 n_total = (
                     len(sample_token_ids)
                     if sample_token_ids is not None
-                    else _count_tokens(gen_text, tokenizer)
+                    else _count_tokens(gen_text, tok_for_cot)
                 )
                 cot_text, answer_text = split_cot_and_answer(
                     gen_text, prompt_ended_with_think=ended_with_think
                 )
                 n_cot = count_cot_tokens(
                     gen_text,
-                    tokenizer=tokenizer,
+                    tokenizer=tok_for_cot,
                     token_ids=sample_token_ids,
                     is_full_generation=True,
                     prompt_ended_with_think=ended_with_think,

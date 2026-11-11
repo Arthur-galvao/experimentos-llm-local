@@ -18,13 +18,16 @@ except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
 from lib.dory import (
+    TOKENIZER_TEST_TEXTS,
     DoryConfig,
     DoryForCausalLM,
     init_new_tokens_embeddings,
     logit_lens_per_loop,
     set_dory_loops,
+    verify_tokenizer_equivalence,
+    verify_vllm_hf_equivalence,
 )
-from lib.evals import build_lcb_quick_split
+from lib.evals import VLLM_EVAL_BATCH_SIZE, _run_problems_loop, build_lcb_quick_split
 from lib.gen import (
     DORY_VLLM_OVERRIDE_KEYS,
     build_dory_hf_overrides,
@@ -33,7 +36,7 @@ from lib.gen import (
     split_cot_and_answer,
 )
 from lib.hw import detect_hardware_profile, get_hw_config
-from lib.io import CheckpointManager, ResumableProgress
+from lib.io import CheckpointManager, ResumableProgress, ensure_model_files, setup_drive_and_cache
 from lib.metrics import check_phase_gate, compute_pareto_frontier, plot_pareto
 from lib.registry import RESULT_FIELDS, append_result, load_results
 from lib.rewards import compute_reward, make_grpo_reward_fn
@@ -662,6 +665,8 @@ def test_from_pretrained_roundtrip_preserves_logits() -> None:
     """Regressão: no transformers 5.x, buffers não persistentes (ex.: inv_freq do RoPE) ficavam com lixo
     após from_pretrained, desligando o RoPE em silêncio (teste de equivalência deu 70% de divergência).
     Salvar e recarregar o modelo deve reproduzir exatamente os mesmos logits."""
+    if torch is None:
+        return
     model, tokenizer = _make_tiny_dory(n_loops=2)
     with torch.no_grad():
         for p in model.parameters():
@@ -682,6 +687,250 @@ def test_from_pretrained_roundtrip_preserves_logits() -> None:
         with torch.no_grad():
             out = loaded(input_ids=input_ids).logits
     assert torch.allclose(ref, out, atol=1e-5), f"max diff = {(ref - out).abs().max().item()}"
+
+
+def test_hf_cache_never_points_to_drive_and_ensure_model_files() -> None:
+    """Garante que nenhuma variável de cache do HF aponta para /content/drive, que hf_cache foi
+    removido dos caminhos, e que ensure_model_files rebaixa arquivos JSON corrompidos com force_download=True.
+    """
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        stale_cache = tmp_path / "hf_cache"
+        stale_cache.mkdir(parents=True, exist_ok=True)
+        (stale_cache / "corrupted.json").write_text("{bad", encoding="utf-8")
+
+        paths = setup_drive_and_cache(
+            drive_root="/content/drive/MyDrive/coder-comprimido",
+            local_fallback_root=tmp_path,
+        )
+
+        assert "hf_cache" not in paths
+        for key, val in paths.items():
+            assert "hf_cache" not in str(val), f"Caminho '{key}' não pode conter hf_cache: {val}"
+
+        hf_cache_vars = ("HF_HOME", "HF_HUB_CACHE", "HF_DATASETS_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE")
+        for var in hf_cache_vars:
+            val_str = os.environ.get(var, "")
+            assert "/content/drive" not in val_str.replace("\\", "/"), (
+                f"Variável {var}={val_str!r} jamais pode apontar para /content/drive!"
+            )
+
+        assert os.environ["HF_HOME"] == "/root/.cache/huggingface"
+        assert os.environ["HF_HUB_CACHE"] == "/root/.cache/huggingface/hub"
+        assert os.environ["HF_DATASETS_CACHE"] == "/root/.cache/huggingface/datasets"
+        assert not stale_cache.exists()
+
+        # Test ensure_model_files with corrupted tokenizer.json
+        model_dir = tmp_path / "hub_mock"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "config.json").write_text('{"model_type": "dory"}', encoding="utf-8")
+        (model_dir / "tokenizer_config.json").write_text('{"tokenizer_class": "PreTrainedTokenizerFast"}', encoding="utf-8")
+        (model_dir / "tokenizer.json").write_text('{"version": "1.0", "trunc', encoding="utf-8")
+
+        download_calls: list[tuple[str, str, bool]] = []
+
+        def fake_download(repo: str, filename: str, force_download: bool = False) -> str:
+            download_calls.append((repo, filename, bool(force_download)))
+            target_file = model_dir / filename
+            if force_download and filename == "tokenizer.json":
+                target_file.write_text('{"version": "1.0", "model": {"type": "BPE"}}', encoding="utf-8")
+            return str(target_file)
+
+        verified = ensure_model_files("nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16", download_fn=fake_download)
+        assert set(verified.keys()) == {"config.json", "tokenizer_config.json", "tokenizer.json"}
+        for p in verified.values():
+            with p.open("r", encoding="utf-8") as f:
+                assert isinstance(json.load(f), dict)
+
+        assert ("nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16", "tokenizer.json", False) in download_calls
+        assert ("nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16", "tokenizer.json", True) in download_calls
+
+
+def test_verify_vllm_hf_equivalence_params_and_vllm_batches_of_128() -> None:
+    """Verifica parâmetros gpu_memory_utilization=0.60 e max_model_len=2048 (>=1024) em verify_vllm_hf_equivalence,
+    lotes de 128 com checkpoint por lote no vLLM, e guarda __main__ em todos os scripts de scripts/.
+    """
+    import ast
+    import inspect
+
+    sig = inspect.signature(verify_vllm_hf_equivalence)
+    assert sig.parameters["gpu_memory_utilization"].default == 0.60
+    assert sig.parameters["max_model_len"].default == 2048
+
+    # max_model_len < 1024 (sliding window) must raise ValueError
+    raised_short_ctx = False
+    try:
+        verify_vllm_hf_equivalence(prompts=["hi"], loops=(1,), max_model_len=512)
+    except ValueError:
+        raised_short_ctx = True
+    assert raised_short_ctx is True, "max_model_len < 1024 deve levantar ValueError!"
+
+    # Verify VLLM_EVAL_BATCH_SIZE == 128 and checkpointing per batch of 128
+    assert VLLM_EVAL_BATCH_SIZE == 128
+
+    batch_sizes_seen: list[int] = []
+    checkpoint_counts_after_each_batch: list[int] = []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        cache_dir = tmp_path / "eval_cache"
+        results_path = tmp_path / "results" / "results.jsonl"
+        run_id = "test_vllm_batch128"
+        bench_name = "synthetic_bench"
+        cache_file = cache_dir / f"{run_id}_{bench_name}_quick.jsonl"
+
+        class BatchTrackingVLLMEngine:
+            def generate(self, prompts: list[str], sampling_params: Any) -> list[Any]:
+                # Before generating the next batch, check how many items are already checkpointed on disk
+                if cache_file.exists():
+                    lines = [ln for ln in cache_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                    checkpoint_counts_after_each_batch.append(len(lines))
+                else:
+                    checkpoint_counts_after_each_batch.append(0)
+                batch_sizes_seen.append(len(prompts))
+
+                class _Sample:
+                    def __init__(self) -> None:
+                        self.text = "<think> step 1 </think>\n```python\ndef f(x):\n    return x + 1\n```"
+                        self.token_ids = [3, 5, 6, 4, 25, 26]
+
+                class _ReqOut:
+                    def __init__(self) -> None:
+                        self.outputs = [_Sample()]
+
+                return [_ReqOut() for _ in prompts]
+
+        # Provide a lightweight mock vllm.SamplingParams if vllm is not installed locally
+        import sys as _sys
+        import types as _types
+
+        had_vllm = "vllm" in _sys.modules
+        if not had_vllm:
+            fake_vllm_mod = _types.ModuleType("vllm")
+
+            class _FakeSamplingParams:
+                def __init__(self, **kwargs: Any) -> None:
+                    self.kwargs = kwargs
+
+            fake_vllm_mod.SamplingParams = _FakeSamplingParams  # type: ignore[attr-defined]
+            _sys.modules["vllm"] = fake_vllm_mod
+
+        try:
+            problems = [
+                {
+                    "task_id": f"task_{i}",
+                    "prompt": "def f(x):",
+                    "test_code": None,
+                    "entry_point": None,
+                }
+                for i in range(300)
+            ]
+            tok = DeterministicWordTokenizer()
+            _run_problems_loop(
+                problems=problems,
+                model=BatchTrackingVLLMEngine(),
+                tokenizer=tok,
+                run_id=run_id,
+                phase="F0",
+                model_name="dory-4b",
+                checkpoint="base",
+                n_loops=2,
+                eval_tier="quick",
+                bench_name=bench_name,
+                max_new_tokens=64,
+                temperature=0.0,
+                batch_size=4,
+                cache_dir=cache_dir,
+                results_path=results_path,
+                smoke=False,
+                smoke_n=5,
+                force=True,
+                backend="vllm",
+            )
+        finally:
+            if not had_vllm:
+                _sys.modules.pop("vllm", None)
+
+        assert batch_sizes_seen == [128, 128, 44], f"Esperado lotes [128, 128, 44], obtido {batch_sizes_seen}"
+        assert checkpoint_counts_after_each_batch == [0, 128, 256]
+
+    # Verify all scripts in scripts/ have main() + if __name__ == "__main__": and no loose top-level code
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    script_files = list(scripts_dir.glob("*.py"))
+    assert len(script_files) >= 4
+    for sf in script_files:
+        tree = ast.parse(sf.read_text(encoding="utf-8"), filename=str(sf))
+        has_main_def = False
+        has_main_guard = False
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == "main":
+                has_main_def = True
+            elif isinstance(node, ast.If):
+                # Must be `if __name__ == "__main__":`
+                test_src = ast.unparse(node.test)
+                assert "__name__" in test_src and "__main__" in test_src, (
+                    f"If no nível de módulo em {sf.name} não é guarda __main__: {test_src}"
+                )
+                has_main_guard = True
+            elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                # Module docstring is allowed
+                continue
+            elif isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            else:
+                raise AssertionError(
+                    f"Código solto no nível do módulo detectado em {sf.name}: {ast.dump(node)}"
+                )
+        assert has_main_def, f"Script {sf.name} precisa definir def main()"
+        assert has_main_guard, f"Script {sf.name} precisa ter if __name__ == '__main__':"
+
+
+def test_tokenizer_20_texts_hf_vs_vllm_and_fix_mistral_regex() -> None:
+    """Testa que TOKENIZER_TEST_TEXTS contém 20 textos variados (código, inglês, espaços e quebras de linha)
+    e que verify_tokenizer_equivalence detecta divergência de regex entre HF e vLLM e ativa fix_mistral_regex=True.
+    """
+    assert len(TOKENIZER_TEST_TEXTS) == 20
+    # Ensure coverage of code, English, multiple spaces, tabs, and newlines
+    assert any("def " in t for t in TOKENIZER_TEST_TEXTS)
+    assert any("\t" in t for t in TOKENIZER_TEST_TEXTS)
+    assert any("\n\n" in t for t in TOKENIZER_TEST_TEXTS)
+    assert any("don't" in t or "it's" in t for t in TOKENIZER_TEST_TEXTS)
+
+    class RegexSensitiveMockTokenizer:
+        def __init__(self, fix_mistral_regex: bool = False) -> None:
+            self.fix_mistral_regex = bool(fix_mistral_regex)
+            self.pad_token = "<pad>"
+            self.eos_token = "<eos>"
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            if self.fix_mistral_regex:
+                # Canonical tokenization matching vLLM with fixed Mistral regex
+                return [ord(c) % 97 for c in text]
+            # Unfixed regex bug splits contractions/newlines/spaces differently
+            if "  " in text or "\n" in text or "'" in text:
+                return [(ord(c) + 13) % 97 for c in text]
+            return [ord(c) % 97 for c in text]
+
+    vllm_tok = RegexSensitiveMockTokenizer(fix_mistral_regex=True)
+
+    def mock_hf_loader(repo: str, fix_mistral_regex: bool | None = None) -> Any:
+        return RegexSensitiveMockTokenizer(fix_mistral_regex=bool(fix_mistral_regex))
+
+    report = verify_tokenizer_equivalence(
+        "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
+        texts=TOKENIZER_TEST_TEXTS,
+        hf_tokenizer=RegexSensitiveMockTokenizer(fix_mistral_regex=False),
+        vllm_tokenizer=vllm_tok,
+        hf_tokenizer_loader=mock_hf_loader,
+    )
+    assert report["n_texts"] == 20
+    assert report["divergences_initial"] > 0
+    assert report["divergences_final"] == 0
+    assert report["matched"] is True
+    assert report["fix_mistral_regex"] is True
 
 
 class CriticalModulesTestSuite(unittest.TestCase):
@@ -719,6 +968,15 @@ class CriticalModulesTestSuite(unittest.TestCase):
 
     def test_11_vllm_failure_raises_when_allow_hf_fallback_false(self) -> None:
         test_vllm_failure_raises_when_allow_hf_fallback_false()
+
+    def test_12_hf_cache_never_points_to_drive_and_ensure_model_files(self) -> None:
+        test_hf_cache_never_points_to_drive_and_ensure_model_files()
+
+    def test_13_verify_vllm_hf_equivalence_params_and_vllm_batches_of_128(self) -> None:
+        test_verify_vllm_hf_equivalence_params_and_vllm_batches_of_128()
+
+    def test_14_tokenizer_20_texts_hf_vs_vllm_and_fix_mistral_regex(self) -> None:
+        test_tokenizer_20_texts_hf_vs_vllm_and_fix_mistral_regex()
 
 
 if __name__ == "__main__":

@@ -926,6 +926,146 @@ def set_dory_loops(
             model.config.kv_cache_mode = kv_cache_mode
 
 
+TOKENIZER_TEST_TEXTS: tuple[str, ...] = (
+    "def fibonacci(n: int) -> int:\n    if n <= 1:\n        return n\n    return fibonacci(n - 1) + fibonacci(n - 2)\n",
+    "def two_sum(nums, target):\n    seen = {}\n    for i, x in enumerate(nums):\n        if target - x in seen:\n            return [seen[target - x], i]\n        seen[x] = i\n",
+    "class DisjointSet:\n    def __init__(self, n: int):\n        self.parent = list(range(n))\n\n    def find(self, x: int) -> int:\n        while self.parent[x] != x:\n            self.parent[x] = self.parent[self.parent[x]]\n            x = self.parent[x]\n        return x\n",
+    "import sys\n\ndef main():\n    data = sys.stdin.read().split()\n    if not data:\n        return\n    n = int(data[0])\n    print(n * (n + 1) // 2)\n",
+    "    # Indentation with 4, 8, and 12 spaces\n        for i in range(10):\n            if i % 2 == 0:\n                print(i)\n",
+    "\t# Tabs vs spaces:\n\tdef f(x):\n\t\treturn x + 1\n\n\t\t# trailing tabs\t\t\n",
+    "Multiple   consecutive    spaces     and\n\n\nthree blank lines between paragraphs.",
+    "Windows CRLF line endings:\r\nline_1 = 100\r\nline_2 = 200\r\nprint(line_1 + line_2)\r\n",
+    "We don't need O(N^2) time when O(N log N) sorting suffices; it's 100x faster on 100,000 items!",
+    "In dynamic programming, let dp[i][j] be the minimum cost to transform prefix s[:i] into t[:j].",
+    "<think>\nStep 1: Parse the input array and edge cases (n = 0, n = 1, negative values).\nStep 2: Apply binary search on the answer space [0, 10**9].\n</think>\n```python\ndef solve(arr):\n    return sorted(arr)\n```",
+    "Regex & escapes: r'^[a-zA-Z0-9_]+@[a-z]+\\.[a-z]{2,4}$' and '\\n\\t\\\\'",
+    "Math & symbols: a_i <= b_j != c_k >= 0, x ** 2 + y ** 2 == z ** 2, f(x) = (x >> 1) ^ (x & 0xFF)",
+    "Numbers & floats: 0, -1, 42, 3.141592653589793, 1e-9, 1_000_000_007, 0xdeadbeef, 0b101010",
+    "List comprehension: [x * y for x in range(1, 5) for y in range(1, 5) if (x + y) % 3 == 0]",
+    'Docstring:\n"""Compute the greatest common divisor of a and b.\n\nArgs:\n    a: First integer.\n    b: Second integer.\n"""',
+    "Edge punctuation: () [] {} <> , . ; : ! ? @ # $ % ^ & * - + = ~ ` | / \\ ' \"",
+    "Unicode & accents in comments: # Complexidade O(n log n) — verificação de fronteira (α = 0.05, λ = 0.1)",
+    "Empty and whitespace-only segments: '   ', '\\n', '\\t\\n  \\t', ''",
+    "dp = [[float('inf')] * (m + 1) for _ in range(n + 1)]\ndp[0][0] = 0\n",
+)
+
+_DORY_FIX_MISTRAL_REGEX: bool | None = None
+
+
+def load_dory_tokenizer(
+    model_name_or_path: str = DORY_HF_REPO,
+    *,
+    fix_mistral_regex: bool | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Load `AutoTokenizer` for Dory/Qwen, applying `fix_mistral_regex` when needed so HF and vLLM match."""
+    use_fix = _DORY_FIX_MISTRAL_REGEX if fix_mistral_regex is None else fix_mistral_regex
+    tok_kwargs = dict(kwargs)
+    tok_kwargs.setdefault("trust_remote_code", True)
+    if use_fix is not None:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name_or_path,
+                fix_mistral_regex=bool(use_fix),
+                **tok_kwargs,
+            )
+        except TypeError:
+            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tok_kwargs)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tok_kwargs)
+    if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def _encode_plain(tok: Any, text: str) -> list[int]:
+    """Encode `text` without special tokens into a list of int token IDs."""
+    try:
+        ids = tok.encode(text, add_special_tokens=False)
+    except TypeError:
+        ids = tok.encode(text)
+    return [int(x) for x in ids]
+
+
+def verify_tokenizer_equivalence(
+    model_name_or_path: str = DORY_HF_REPO,
+    *,
+    texts: tuple[str, ...] | list[str] = TOKENIZER_TEST_TEXTS,
+    hf_tokenizer: Any | None = None,
+    vllm_tokenizer: Any | None = None,
+    hf_tokenizer_loader: Any | None = None,
+) -> dict[str, Any]:
+    """Tokenize the same 20 texts (code, English, spaces, newlines) with the HF tokenizer and
+    the vLLM tokenizer and compare token IDs. If they diverge, retry with `fix_mistral_regex=True`
+    so both produce identical token ID sequences.
+    """
+    global _DORY_FIX_MISTRAL_REGEX
+    text_list = list(texts)
+
+    def _load_hf(fix_flag: bool | None) -> Any:
+        if hf_tokenizer_loader is not None:
+            return hf_tokenizer_loader(model_name_or_path, fix_mistral_regex=fix_flag)
+        return load_dory_tokenizer(model_name_or_path, fix_mistral_regex=fix_flag)
+
+    if hf_tokenizer is None:
+        hf_tokenizer = _load_hf(_DORY_FIX_MISTRAL_REGEX)
+
+    if vllm_tokenizer is None:
+        try:
+            from vllm.transformers_utils.tokenizer import get_tokenizer as _vllm_get_tok  # type: ignore[import-not-found]
+
+            vllm_tokenizer = _vllm_get_tok(model_name_or_path, trust_remote_code=True)
+        except Exception:
+            vllm_tokenizer = _load_hf(None)
+
+    def _compare(tok_a: Any, tok_b: Any) -> list[dict[str, Any]]:
+        diffs: list[dict[str, Any]] = []
+        for idx, t in enumerate(text_list):
+            ids_a = _encode_plain(tok_a, t)
+            ids_b = _encode_plain(tok_b, t)
+            if ids_a != ids_b:
+                diffs.append(
+                    {
+                        "text_idx": idx,
+                        "hf_ids": ids_a,
+                        "vllm_ids": ids_b,
+                    }
+                )
+        return diffs
+
+    initial_diffs = _compare(hf_tokenizer, vllm_tokenizer)
+    fix_used = bool(_DORY_FIX_MISTRAL_REGEX)
+    final_diffs = initial_diffs
+
+    if initial_diffs:
+        # Try fix_mistral_regex=True on HF tokenizer to match vLLM (or vice-versa)
+        cand_hf_true = _load_hf(True)
+        diffs_true = _compare(cand_hf_true, vllm_tokenizer)
+        if len(diffs_true) < len(final_diffs):
+            hf_tokenizer = cand_hf_true
+            final_diffs = diffs_true
+            fix_used = True
+            _DORY_FIX_MISTRAL_REGEX = True
+        if final_diffs:
+            cand_hf_false = _load_hf(False)
+            diffs_false = _compare(cand_hf_false, vllm_tokenizer)
+            if len(diffs_false) < len(final_diffs):
+                hf_tokenizer = cand_hf_false
+                final_diffs = diffs_false
+                fix_used = False
+                _DORY_FIX_MISTRAL_REGEX = False
+
+    return {
+        "n_texts": len(text_list),
+        "matched": len(final_diffs) == 0,
+        "divergences_initial": len(initial_diffs),
+        "divergences_final": len(final_diffs),
+        "fix_mistral_regex": fix_used,
+        "details": final_diffs,
+        "tokenizer": hf_tokenizer,
+    }
+
+
 def load_dory(
     model_name_or_path: str = DORY_HF_REPO,
     *,
@@ -934,6 +1074,7 @@ def load_dory(
     torch_dtype: Any = "bfloat16",
     device_map: str | dict[str, Any] | None = "auto",
     load_in_4bit: bool = False,
+    fix_mistral_regex: bool | None = None,
     **kwargs: Any,
 ) -> tuple[DoryForCausalLM, Any]:
     """Load `DoryForCausalLM` and its `AutoTokenizer` with runtime loop control."""
@@ -942,9 +1083,7 @@ def load_dory(
     if torch_dtype == "bfloat16":
         torch_dtype = torch.bfloat16
     register_dory_auto()
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = load_dory_tokenizer(model_name_or_path, fix_mistral_regex=fix_mistral_regex)
 
     load_kwargs: dict[str, Any] = dict(kwargs)
     if load_in_4bit:
@@ -1535,6 +1674,8 @@ def verify_vllm_hf_equivalence(
     max_new_tokens: int = 32,
     max_divergence_rate: float = 0.02,
     model_name_or_path: str = DORY_HF_REPO,
+    gpu_memory_utilization: float = 0.60,
+    max_model_len: int = 2048,
     hf_model: Any | None = None,
     tokenizer: Any | None = None,
     vllm_runner: Any | None = None,
@@ -1556,11 +1697,14 @@ def verify_vllm_hf_equivalence(
     import json
     from pathlib import Path
 
+    if int(max_model_len) < 1024:
+        raise ValueError(
+            f"max_model_len ({max_model_len}) nunca pode ser abaixo de 1024 (sliding_window do Dory)."
+        )
+
     prompt_list = list(prompts)
     if tokenizer is None and _HAS_TORCH and vllm_runner is None:
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer = load_dory_tokenizer(model_name_or_path)
 
     # Format prompts with chat template if tokenizer is available
     formatted_prompts: list[str] = []
@@ -1610,8 +1754,8 @@ def verify_vllm_hf_equivalence(
                 trust_remote_code=True,
                 dtype="bfloat16",
                 hf_overrides={"n_recurrent_loops": int(k)},
-                gpu_memory_utilization=0.80,
-                max_model_len=4096,
+                gpu_memory_utilization=float(gpu_memory_utilization),
+                max_model_len=int(max_model_len),
                 seed=42,
             )
             sp = SamplingParams(

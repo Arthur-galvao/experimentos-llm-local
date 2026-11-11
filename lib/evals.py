@@ -18,6 +18,7 @@ from .registry import DEFAULT_RESULTS_PATH, append_result, has_completed_run
 from .sandbox import check_solution
 
 DEFAULT_LCB_QUICK_PATH = Path("data") / "lcb_quick.json"
+VLLM_EVAL_BATCH_SIZE = 128
 
 
 def _decode_lcb_test_cases(raw_field: Any) -> list[dict[str, str]]:
@@ -210,7 +211,7 @@ def _run_problems_loop(
             f"{len(pending)} pending / {len(active_problems)} total problems..."
         )
 
-    step_size = max(1, len(pending)) if backend == "vllm" else max(1, batch_size)
+    step_size = VLLM_EVAL_BATCH_SIZE if backend == "vllm" else max(1, batch_size)
     for start in range(0, len(pending), step_size):
         batch = pending[start : start + step_size]
         prompts = [
