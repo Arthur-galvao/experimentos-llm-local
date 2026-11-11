@@ -13,7 +13,7 @@ def main() -> None:
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    from lib.dory import DORY_HF_REPO, verify_tokenizer_equivalence
+    from lib.dory import DORY_HF_REPO, format_tokenizer_report, verify_tokenizer_equivalence
     from lib.evals import build_lcb_quick_split
     from lib.hw import get_hw_config, print_hardware_summary
     from lib.io import DEFAULT_DRIVE_ROOT, ensure_model_files, setup_drive_and_cache
@@ -32,10 +32,9 @@ def main() -> None:
         print(f"  [OK] {fname}: {p}")
 
     tok_report = verify_tokenizer_equivalence(DORY_HF_REPO)
-    print(
-        f"[Tokenizer] {tok_report['n_texts']} textos | "
-        f"matched={tok_report['matched']} | fix_mistral_regex={tok_report['fix_mistral_regex']}"
-    )
+    print(format_tokenizer_report(tok_report))
+    if not tok_report["verified"]:
+        print("[Tokenizer] ATENÇÃO: equivalência HF vs vLLM não verificada; seguindo a preparação sem interromper.")
 
     lcb_quick_path = paths["data"] / "lcb_quick.json"
     items = build_lcb_quick_split(output_path=lcb_quick_path, n_problems=200)

@@ -12,13 +12,28 @@ import zlib
 from pathlib import Path
 from typing import Any
 
-from .gen import Output, format_chat_prompt, generate
+from .gen import THINK_CLOSE, Output, format_chat_prompt, generate
 from .io import ResumableProgress
 from .registry import DEFAULT_RESULTS_PATH, append_result, has_completed_run
 from .sandbox import check_solution
+from .scicode_eval import (
+    SCICODE_PROTOCOL_ID,
+    SCICODE_TEST_TIMEOUT_S,
+    build_scicode_problems,
+    ensure_scicode_test_data,
+    load_scicode_rows,
+    make_scicode_extra_metrics_fn,
+)
 
 DEFAULT_LCB_QUICK_PATH = Path("data") / "lcb_quick.json"
 VLLM_EVAL_BATCH_SIZE = 128
+LCB_TIMEOUT_PER_TEST_S = 6.0  # lcb_runner: timeout padrão por teste
+# Protocolo LCB: todos os testes (públicos + privados), parada no 1º erro, stdin e funcional.
+# Resultados/caches anteriores (testes truncados em 15 e privados não decodificados) não são reaproveitados.
+LCB_PROTOCOL_ID = "lcb_official_all_tests_v2"
+# Protocolo EvalPlus: base_input + plus_input contra a solução canônica (teste diferencial oficial).
+# Resultados antigos (que usavam só o `test`/`assertion` original, sem os testes plus) não são reaproveitados.
+EVALPLUS_PROTOCOL_ID = "evalplus_base_plus_v1"
 
 
 def _decode_lcb_test_cases(raw_field: Any) -> list[dict[str, str]]:
@@ -50,7 +65,11 @@ def _decode_lcb_test_cases(raw_field: Any) -> list[dict[str, str]]:
             try:
                 parsed = json.loads(decompressed.decode("utf-8"))
             except Exception:
+                # Formato oficial (lcb_runner/benchmarks/code_generation.py): base64 -> zlib -> pickle,
+                # e o pickle contém uma STRING JSON, que ainda precisa de json.loads.
                 parsed = pickle.loads(decompressed)
+            if isinstance(parsed, (str, bytes)):
+                parsed = json.loads(parsed)
             if isinstance(parsed, list):
                 return [
                     {"input": str(tc.get("input", "")), "output": str(tc.get("output", ""))}
@@ -93,6 +112,25 @@ def _iter_lcb_rows(version_tag: str):
                     yield _json.loads(line)
 
 
+# Versão do formato dos itens do LCB em disco. v2 = todos os testes (sem corte em 15), testes
+# privados decodificados corretamente e `fn_name` (modo funcional). Caches antigos são refeitos.
+LCB_SCHEMA_VERSION = 2
+
+
+def _lcb_fn_name(raw_metadata: Any) -> str | None:
+    """Extrai `func_name` do campo `metadata` do LCB (string JSON ou dict); None => teste stdin/stdout."""
+    meta = raw_metadata
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta) if meta.strip() else {}
+        except Exception:
+            meta = {}
+    if isinstance(meta, dict):
+        name = meta.get("func_name")
+        return str(name) if name else None
+    return None
+
+
 def load_lcb_v6_dataset(version_tag: str = "release_v6") -> list[dict[str, Any]]:
     """Load `livecodebench/code_generation_lite` (`release_v6`) lendo os .jsonl diretamente."""
     ds = _iter_lcb_rows(version_tag)
@@ -102,8 +140,8 @@ def load_lcb_v6_dataset(version_tag: str = "release_v6") -> list[dict[str, Any]]
         q_id = str(row.get("question_id") or row.get("id") or len(items))
         pub_tests = _decode_lcb_test_cases(row.get("public_test_cases"))
         priv_tests = _decode_lcb_test_cases(row.get("private_test_cases"))
-        # Keep a bounded number of private tests per problem to avoid excessive I/O in quick eval
-        all_tests = (pub_tests + priv_tests)[:15]
+        # Protocolo oficial: TODOS os testes públicos + privados (sem limite por problema).
+        all_tests = pub_tests + priv_tests
         items.append(
             {
                 "question_id": q_id,
@@ -113,6 +151,9 @@ def load_lcb_v6_dataset(version_tag: str = "release_v6") -> list[dict[str, Any]]
                 "contest_date": str(row.get("contest_date", "") or ""),
                 "difficulty": str(row.get("difficulty", "") or ""),
                 "io_examples": all_tests,
+                # Nome da função (LeetCode/funcional) vem de `metadata.func_name`; None => stdin/stdout.
+                "fn_name": _lcb_fn_name(row.get("metadata")),
+                "lcb_schema": LCB_SCHEMA_VERSION,
             }
         )
     return items
@@ -131,7 +172,13 @@ def build_lcb_quick_split(
     """
     out = Path(output_path)
     if out.exists() and not force:
-        return json.loads(out.read_text(encoding="utf-8"))
+        cached = json.loads(out.read_text(encoding="utf-8"))
+        stale = any(
+            "io_examples" in it and it.get("lcb_schema") != LCB_SCHEMA_VERSION for it in cached
+        )
+        if not stale:
+            return cached
+        print(f"[lcb] Cache {out} está em formato antigo (testes truncados/sem fn_name); regenerando.")
 
     items = preloaded_items if preloaded_items is not None else load_lcb_v6_dataset(version_tag=version_tag)
     sorted_items = sorted(
@@ -174,6 +221,40 @@ def _build_coding_prompt(
     )
 
 
+# Template oficial do LiveCodeBench para geração de código
+# (https://github.com/LiveCodeBench/LiveCodeBench/blob/main/lcb_runner/prompts/code_generation.py):
+# `PromptConstants.SYSTEM_MESSAGE_GENERIC`, `FORMATTING_MESSAGE_WITH_STARTER_CODE`,
+# `FORMATTING_WITHOUT_STARTER_CODE` e `get_generic_question_template_answer`. A mensagem de sistema vai
+# como `system` e o corpo como `user`; o chat template do modelo faz o envolvimento (format_chat_prompt).
+LCB_SYSTEM_MESSAGE = (
+    "You are an expert Python programmer. You will be given a question (problem specification) and will "
+    "generate a correct Python program that matches the specification and passes all tests."
+)
+_LCB_FORMAT_WITH_STARTER = (
+    "You will use the following starter code to write the solution to the problem and enclose your code "
+    "within delimiters."
+)
+_LCB_FORMAT_WITHOUT_STARTER = (
+    "Read the inputs from stdin solve the problem and write the answer to stdout (do not directly test on "
+    "the sample inputs). Enclose your code within delimiters as follows. Ensure that when the python "
+    "program runs, it reads the inputs, runs the algorithm and writes output to STDOUT."
+)
+
+
+def _build_lcb_prompt(question_content: str, starter_code: str = "") -> str:
+    """Corpo `user` do prompt oficial do LiveCodeBench (`get_generic_question_template_answer`).
+    Não aplica `.strip()` ao enunciado nem ao starter code, igual ao oficial."""
+    prompt = f"### Question:\n{question_content}\n\n"
+    if starter_code:
+        prompt += f"### Format: {_LCB_FORMAT_WITH_STARTER}\n"
+        prompt += f"```python\n{starter_code}\n```\n\n"
+    else:
+        prompt += f"### Format: {_LCB_FORMAT_WITHOUT_STARTER}\n"
+        prompt += "```python\n# YOUR CODE HERE\n```\n\n"
+    prompt += "### Answer: (use the provided format with backticks)\n\n"
+    return prompt
+
+
 def _run_problems_loop(
     *,
     problems: list[dict[str, Any]],
@@ -198,8 +279,22 @@ def _run_problems_loop(
     seed: int = 42,
     backend: str = "vllm",
     extra_config: dict[str, Any] | None = None,
+    protocol_id: str | None = None,
+    cache_suffix: str = "",
+    extra_config_fn: Any | None = None,
 ) -> dict[str, Any]:
-    """Generic resumable evaluation loop over standardized problem dicts."""
+    """Generic resumable evaluation loop over standardized problem dicts.
+
+    Chaves opcionais por problema (usadas pelo SciCode, onde os passos dependem das respostas anteriores):
+    - `stage` (int, padrão 0): problemas rodam em ondas por `stage` crescente (uma onda só começa quando a
+      anterior terminou), mantendo o lote vLLM dentro de cada onda;
+    - `build_prompt(get_record) -> str`: monta o prompt na hora de gerar (substitui `prompt`);
+    - `grader(candidate, get_record) -> (SandboxResult, dict)`: substitui `check_solution`; o dict extra
+      é gravado junto ao registro do problema.
+    `protocol_id` marca o protocolo de avaliação no config e impede reaproveitar resultados antigos
+    (de um protocolo diferente) em `results.jsonl`; `cache_suffix` separa o cache por problema;
+    `extra_config_fn({task_id: registro}) -> dict` acrescenta métricas ao config final.
+    """
     effective_tier = "smoke" if smoke else eval_tier
     allow_hf_fallback = bool(smoke)
 
@@ -210,6 +305,14 @@ def _run_problems_loop(
             eval_tier=effective_tier,
             results_path=results_path,
         )
+        if existing is not None and protocol_id is not None and (
+            (existing.get("config") or {}).get("eval_protocol") != protocol_id
+        ):
+            print(
+                f"[eval] Resultado antigo de {run_id} em {bench_name} ({effective_tier}) usa outro protocolo "
+                f"(esperado '{protocol_id}'); ele NÃO será reaproveitado e a avaliação será refeita."
+            )
+            existing = None
         if existing is not None:
             print(f"[eval] Skipping {run_id} on {bench_name} ({effective_tier}): already in {results_path}")
             return existing
@@ -218,7 +321,7 @@ def _run_problems_loop(
     if not active_problems:
         raise ValueError(f"No problems loaded for benchmark '{bench_name}'.")
 
-    cache_file = Path(cache_dir) / f"{run_id}_{bench_name}_{effective_tier}.jsonl"
+    cache_file = Path(cache_dir) / f"{run_id}_{bench_name}_{effective_tier}{cache_suffix}.jsonl"
     progress = ResumableProgress(cache_file)
 
     pending = [p for p in active_problems if not progress.is_done(str(p["task_id"]))]
@@ -229,10 +332,19 @@ def _run_problems_loop(
         )
 
     step_size = VLLM_EVAL_BATCH_SIZE if backend == "vllm" else max(1, batch_size)
-    for start in range(0, len(pending), step_size):
-        batch = pending[start : start + step_size]
+    # Ondas por `stage` (padrão: tudo na onda 0 => comportamento idêntico ao anterior).
+    batches: list[list[dict[str, Any]]] = []
+    for stage in sorted({int(p.get("stage", 0)) for p in pending}):
+        stage_items = [p for p in pending if int(p.get("stage", 0)) == stage]
+        batches.extend(stage_items[i : i + step_size] for i in range(0, len(stage_items), step_size))
+    for batch in batches:
         prompts = [
-            format_chat_prompt(tokenizer, p["prompt"], enable_thinking=True)
+            format_chat_prompt(
+                tokenizer,
+                p["build_prompt"](progress.get) if p.get("build_prompt") is not None else p["prompt"],
+                system_prompt=p.get("system_prompt"),
+                enable_thinking=True,
+            )
             for p in batch
         ]
         outputs: list[Output] = generate(
@@ -251,12 +363,18 @@ def _run_problems_loop(
         )
         for prob, out in zip(batch, outputs):
             candidate = out.answer_text if out.answer_text.strip() else out.text
-            sb = check_solution(
-                candidate,
-                test_code=prob.get("test_code"),
-                entry_point=prob.get("entry_point"),
-                io_examples=prob.get("io_examples"),
-            )
+            extra_fields: dict[str, Any] = {}
+            if prob.get("grader") is not None:
+                sb, extra_fields = prob["grader"](candidate, progress.get)
+            else:
+                sb = check_solution(
+                    candidate,
+                    test_code=prob.get("test_code"),
+                    entry_point=prob.get("entry_point"),
+                    io_examples=prob.get("io_examples"),
+                    fn_name=prob.get("fn_name"),
+                    **prob.get("sandbox_kwargs", {}),
+                )
             progress.record(
                 str(prob["task_id"]),
                 {
@@ -266,6 +384,9 @@ def _run_problems_loop(
                     "latency_s": out.latency_s,
                     "backend": out.backend,
                     "error_type": sb.error_type,
+                    # Truncada = atingiu `max_new_tokens` sem fechar `</think>` (só mede; não altera nada).
+                    "truncated": bool(out.n_total_tokens >= max_new_tokens and THINK_CLOSE not in out.text),
+                    **extra_fields,
                 },
             )
 
@@ -277,6 +398,11 @@ def _run_problems_loop(
     cot_mean = sum(float(r.get("n_cot_tokens", 0)) for r in valid_rows) / n_done
     tot_mean = sum(float(r.get("n_total_tokens", 0)) for r in valid_rows) / n_done
     lat_mean = sum(float(r.get("latency_s", 0.0)) for r in valid_rows) / n_done
+
+    # Fração de respostas truncadas (só entre as linhas que têm o campo; caches antigos não têm).
+    trunc_flags = [bool(r["truncated"]) for r in valid_rows if "truncated" in r]
+    n_truncated = sum(trunc_flags)
+    truncated_frac = (n_truncated / len(trunc_flags)) if trunc_flags else None
 
     recorded_backends = [str(r.get("backend")) for r in valid_rows if r.get("backend")]
     actual_backend = recorded_backends[-1] if recorded_backends else str(backend)
@@ -291,9 +417,15 @@ def _run_problems_loop(
         "batch_size": batch_size,
         "n_problems": len(active_problems),
         "smoke": smoke,
+        "truncated_frac": round(truncated_frac, 6) if truncated_frac is not None else None,
+        "n_truncated": n_truncated,
     }
     if extra_config:
         cfg.update(extra_config)
+    if protocol_id is not None:
+        cfg["eval_protocol"] = protocol_id
+    if extra_config_fn is not None:
+        cfg.update(extra_config_fn({str(p["task_id"]): r for p, r in zip(active_problems, rows)}))
 
     if smoke:
         denom = cot_mean if cot_mean > 0 else max(tot_mean, 1.0)
@@ -311,6 +443,8 @@ def _run_problems_loop(
             "tokens_total_mean": round(tot_mean, 3),
             "latency_mean_s": round(lat_mean, 4),
             "acerto_por_1k_tokens": round(pass1 / (denom / 1000.0), 6),
+            "truncated_frac": cfg["truncated_frac"],
+            "n_problems": len(active_problems),
             "config": cfg,
         }
 
@@ -331,6 +465,44 @@ def _run_problems_loop(
     )
 
 
+_EVALPLUS_GT_CACHE: dict[str, dict[str, list[Any]]] = {}
+
+
+def _make_evalplus_grader(bench: str, task_id: str, item: dict[str, Any]) -> Any:
+    """Cria o `grader(candidate, get_record)` do EvalPlus oficial para um problema (ver
+    `lib.sandbox.check_evalplus_solution`). A saída esperada é calculada uma vez por processo,
+    executando `prompt + canonical_solution` em base_input + plus_input (como `get_groundtruth`)."""
+    from .sandbox import MBPP_OUTPUT_NOT_NONE_TASKS, check_evalplus_solution, compute_evalplus_groundtruth
+
+    dataset = "humaneval" if bench == "humaneval+" else "mbpp"
+    entry_point = str(item.get("entry_point", ""))
+    cache_key = f"{dataset}:{task_id}"
+
+    def grader(candidate: str, get_record: Any) -> tuple[Any, dict[str, Any]]:
+        gt = _EVALPLUS_GT_CACHE.get(cache_key)
+        if gt is None:
+            gt = compute_evalplus_groundtruth(
+                str(item.get("prompt", "")) + str(item.get("canonical_solution", "")),
+                entry_point=entry_point,
+                base_input=item["base_input"],
+                plus_input=item["plus_input"],
+                output_not_none=(dataset == "mbpp" and entry_point in MBPP_OUTPUT_NOT_NONE_TASKS),
+            )
+            _EVALPLUS_GT_CACHE[cache_key] = gt
+        sb = check_evalplus_solution(
+            candidate,
+            dataset=dataset,
+            entry_point=entry_point,
+            base_input=item["base_input"],
+            plus_input=item["plus_input"],
+            groundtruth=gt,
+            atol=float(item.get("atol", 0) or 0),
+        )
+        return sb, {"eval_protocol": "evalplus_base_plus"}
+
+    return grader
+
+
 def _load_evalplus_problems(bench: str) -> list[dict[str, Any]]:
     """Load HumanEval+ or MBPP+ problems using `evalplus` (or HF `evalplus` fallback)."""
     problems: list[dict[str, Any]] = []
@@ -347,6 +519,23 @@ def _load_evalplus_problems(bench: str) -> list[dict[str, Any]]:
         for task_id, item in raw.items():
             prompt_str = str(item.get("prompt", ""))
             entry_point = str(item.get("entry_point", ""))
+            if "base_input" in item and "plus_input" in item and "canonical_solution" in item:
+                # Protocolo oficial do EvalPlus: teste diferencial contra a solução canônica em
+                # base_input + plus_input (o campo `test`/`assertion` do pacote traz só os testes
+                # ORIGINAIS do HumanEval/MBPP, sem os testes "plus").
+                problems.append(
+                    {
+                        "task_id": task_id,
+                        "prompt": _build_coding_prompt(prompt_str),
+                        "entry_point": entry_point,
+                        "grader": _make_evalplus_grader(bench, str(task_id), item),
+                    }
+                )
+                continue
+            print(
+                f"[evalplus] AVISO: {task_id} sem base_input/plus_input/canonical_solution; "
+                "usando só o teste original (equivale a HumanEval/MBPP base, NÃO a HumanEval+/MBPP+)."
+            )
             test_code = str(item.get("test", "") or item.get("assertion", ""))
             problems.append(
                 {
@@ -361,6 +550,11 @@ def _load_evalplus_problems(bench: str) -> list[dict[str, Any]]:
         from datasets import load_dataset  # type: ignore[import-not-found]
 
         hf_name = "evalplus/humanevalplus" if bench == "humaneval+" else "evalplus/mbppplus"
+        print(
+            f"[evalplus] AVISO: pacote `evalplus` indisponível; usando o dataset HF '{hf_name}' e o campo "
+            "`test` dele. TODO: não foi verificado que esse campo inclua os testes plus nem as tolerâncias "
+            "de float/oráculos especiais do EvalPlus oficial. Prefira `pip install evalplus`."
+        )
         ds = load_dataset(hf_name, split="test")
         for row in ds:
             task_id = str(row.get("task_id"))
@@ -424,6 +618,8 @@ def eval_humaneval_plus(
         smoke=smoke,
         smoke_n=smoke_n,
         force=force,
+        protocol_id=EVALPLUS_PROTOCOL_ID if (problems and problems[0].get("grader")) else None,
+        cache_suffix="_epv1" if (problems and problems[0].get("grader")) else "",
     )
 
 
@@ -473,6 +669,8 @@ def eval_mbpp_plus(
         smoke=smoke,
         smoke_n=smoke_n,
         force=force,
+        protocol_id=EVALPLUS_PROTOCOL_ID if (problems and problems[0].get("grader")) else None,
+        cache_suffix="_epv1" if (problems and problems[0].get("grader")) else "",
     )
 
 
@@ -518,12 +716,12 @@ def eval_lcb_v6(
         problems.append(
             {
                 "task_id": str(item.get("question_id")),
-                "prompt": _build_coding_prompt(
-                    q_content,
-                    starter_code=starter,
-                    is_stdin=(not starter.strip()),
-                ),
+                "prompt": _build_lcb_prompt(q_content, starter),
+                "system_prompt": LCB_SYSTEM_MESSAGE,
                 "io_examples": item.get("io_examples", []),
+                "fn_name": item.get("fn_name"),
+                # LCB oficial: 6 s por teste (parâmetro `timeout` de lcb_runner); memória do processo 4 GB.
+                "sandbox_kwargs": {"timeout_s": LCB_TIMEOUT_PER_TEST_S, "max_memory_mb": 4096},
             }
         )
 
@@ -549,6 +747,8 @@ def eval_lcb_v6(
         smoke=smoke,
         smoke_n=smoke_n,
         force=force,
+        protocol_id=LCB_PROTOCOL_ID,
+        cache_suffix="_lcbv2",
     )
 
 
@@ -594,12 +794,13 @@ def eval_lcb_pro(
             problems.append(
                 {
                     "task_id": q_id,
-                    "prompt": _build_coding_prompt(
-                        content,
-                        starter_code=starter,
-                        is_stdin=(not starter.strip()),
-                    ),
-                    "io_examples": io_cases[:15],
+                    "prompt": _build_lcb_prompt(content, starter),
+                    "system_prompt": LCB_SYSTEM_MESSAGE,
+                    # Todos os casos (sem corte), executados por `run_io_tests_in_sandbox` (parada no 1º erro).
+                    # TODO: limites de tempo/memória e modo funcional do LCB Pro não foram confirmados
+                    # no código oficial; usa-se o padrão do LCB v6 (6 s por teste, 4 GB, stdin/stdout).
+                    "io_examples": io_cases,
+                    "sandbox_kwargs": {"timeout_s": LCB_TIMEOUT_PER_TEST_S, "max_memory_mb": 4096},
                 }
             )
         if not problems:
@@ -631,6 +832,8 @@ def eval_lcb_pro(
             smoke=smoke,
             smoke_n=smoke_n,
             force=force,
+            protocol_id=LCB_PROTOCOL_ID,
+            cache_suffix="_lcbv2",
         )
     except Exception as exc:
         print(
@@ -660,44 +863,34 @@ def eval_scicode(
     smoke: bool = False,
     smoke_n: int = 5,
     force: bool = False,
+    h5py_file: str | Path | None = None,
+    data_dir: str | Path | None = None,
+    with_background: bool = False,
+    scicode_split: str = "test",
+    scicode_timeout_s: float = SCICODE_TEST_TIMEOUT_S,
 ) -> dict[str, Any]:
-    """Run SciCode subproblem evaluation (`SciCode1/SciCode` on HuggingFace / `scicode-bench`)."""
-    from datasets import load_dataset  # type: ignore[import-not-found]
+    """Run SciCode subproblem evaluation seguindo o protocolo oficial (`scicode-bench/SciCode`).
 
-    ds = load_dataset("SciCode1/SciCode", split="test")
-    problems: list[dict[str, Any]] = []
-    for row in ds:
-        prob_id = str(row.get("problem_id", len(problems)))
-        sub_steps = row.get("sub_steps") or []
-        if isinstance(sub_steps, list) and sub_steps:
-            for s_idx, step in enumerate(sub_steps):
-                if not isinstance(step, dict):
-                    continue
-                step_id = str(step.get("step_number") or f"{prob_id}.{s_idx + 1}")
-                desc = str(step.get("step_description_prompt") or step.get("description") or "")
-                header = str(step.get("function_header") or "")
-                test_list = step.get("test_cases") or []
-                test_code = "\n".join(str(t) for t in test_list) if isinstance(test_list, list) else str(test_list)
-                if not desc and not header:
-                    continue
-                problems.append(
-                    {
-                        "task_id": f"scicode_{step_id}",
-                        "prompt": _build_coding_prompt(desc, starter_code=header),
-                        "test_code": test_code,
-                    }
-                )
-        else:
-            desc = str(row.get("problem_description_main") or row.get("description") or "")
-            header = str(row.get("function_header") or "")
-            test_code = str(row.get("test_cases") or "")
-            problems.append(
-                {
-                    "task_id": f"scicode_{prob_id}",
-                    "prompt": _build_coding_prompt(desc, starter_code=header),
-                    "test_code": test_code,
-                }
-            )
+    Cada subproblema é avaliado com o script oficial: dependências + código gerado pelo modelo nos passos
+    anteriores + resposta do passo + `targets` lidos de `test_data.h5` + `test_cases` (ver `lib/scicode_eval.py`).
+    `pass1` = fração de subproblemas testados que passam; as métricas oficiais (subproblemas / problemas
+    principais) ficam no `config` do resultado. Os passos de um mesmo problema dependem uns dos outros, então
+    o loop gera em ondas (todos os passos 1, depois todos os passos 2, ...).
+
+    - `h5py_file`: caminho do `test_data.h5`; se omitido, é baixado (Google Drive oficial) para `data_dir`
+      (padrão: pasta `data` irmã de `cache_dir`) por `ensure_scicode_test_data`.
+    - `with_background=False` é o modo padrão do oficial (o modelo escreve o background como comentário).
+    """
+    h5_path = Path(h5py_file) if h5py_file else ensure_scicode_test_data(
+        data_dir if data_dir is not None else Path(cache_dir).resolve().parent / "data"
+    )
+    if not h5_path.is_file():
+        raise FileNotFoundError(f"test_data.h5 do SciCode não encontrado em {h5_path}")
+
+    rows = load_scicode_rows(scicode_split)
+    problems = build_scicode_problems(
+        rows, h5_path, with_background=with_background, timeout_s=scicode_timeout_s
+    )
 
     return _run_problems_loop(
         problems=problems,
@@ -721,6 +914,14 @@ def eval_scicode(
         smoke=smoke,
         smoke_n=smoke_n,
         force=force,
+        protocol_id=SCICODE_PROTOCOL_ID,
+        cache_suffix="_official",
+        extra_config={
+            "scicode_split": scicode_split,
+            "scicode_with_background": with_background,
+            "scicode_timeout_s": scicode_timeout_s,
+        },
+        extra_config_fn=make_scicode_extra_metrics_fn(rows),
     )
 
 

@@ -21,6 +21,8 @@ from .metrics import (
     check_phase_gate,
     compute_pareto_frontier,
     estimate_compute_cost,
+    loop_compute_factor,
+    measure_smoke_throughput,
     plot_pareto,
 )
 from .dory import (
@@ -52,7 +54,9 @@ from .gen import (
 )
 from .sandbox import (
     SandboxResult,
+    check_evalplus_solution,
     check_solution,
+    compute_evalplus_groundtruth,
     extract_python_code,
     run_code_in_sandbox,
 )
@@ -93,6 +97,8 @@ __all__ = [
     "check_phase_gate",
     "compute_pareto_frontier",
     "estimate_compute_cost",
+    "loop_compute_factor",
+    "measure_smoke_throughput",
     "plot_pareto",
     "DORY_HF_REPO",
     "QWEN_CONTROL_HF_REPO",
@@ -118,7 +124,9 @@ __all__ = [
     "run_vllm_in_subprocess",
     "split_cot_and_answer",
     "SandboxResult",
+    "check_evalplus_solution",
     "check_solution",
+    "compute_evalplus_groundtruth",
     "extract_python_code",
     "run_code_in_sandbox",
     "RewardBreakdown",

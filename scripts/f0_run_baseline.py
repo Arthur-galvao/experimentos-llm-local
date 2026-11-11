@@ -15,6 +15,7 @@ def _run_single_target(target: str, repo_root: Path) -> None:
     from lib.dory import (
         DORY_HF_REPO,
         QWEN_CONTROL_HF_REPO,
+        enforce_tokenizer_report,
         load_dory_tokenizer,
         verify_tokenizer_equivalence,
     )
@@ -35,7 +36,7 @@ def _run_single_target(target: str, repo_root: Path) -> None:
         k_loops = int(target[1:])
         run_id = f"F0_dory_L{k_loops}"
         ensure_model_files(DORY_HF_REPO)
-        verify_tokenizer_equivalence(DORY_HF_REPO)
+        enforce_tokenizer_report(verify_tokenizer_equivalence(DORY_HF_REPO))
         tok = load_dory_tokenizer(DORY_HF_REPO)
 
         print(f"\n>>> [Subprocesso {target}] Executando eval_quick (vLLM, lotes de 128) para {run_id} (n_loops={k_loops})...")

@@ -60,7 +60,9 @@ def main() -> None:
         n_loops=4,
         top_k=5,
         last_n_positions=5,
+        apply_output_block=True,  # estados intermediários só fazem sentido após as Output layers
     )
+    print("\n[Logit lens] Estado de cada loop passado pelas Output layers antes do lm_head.")
     for loop_info in lens_report:
         print(f"\n=== Loop Recorrente #{loop_info['loop_idx']} ===")
         for pos in loop_info["positions"]:

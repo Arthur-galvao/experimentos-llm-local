@@ -809,6 +809,41 @@ def _is_vllm_engine_instance(obj: Any) -> bool:
     return hasattr(obj, "generate")
 
 
+_HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][\w.\-]*/[\w.\-]+$")
+
+
+def _resolve_vllm_model_name(obj: Any) -> str:
+    """Converte o argumento `model` de `generate(..., backend='vllm')` no nome/caminho que o vLLM carrega.
+
+    Só aceita (a) `str` (repo "org/nome" ou caminho local) ou (b) um modelo HF (`torch.nn.Module` com
+    `config`) cujo `config._name_or_path` seja um repo/caminho válido. Callables, mocks e qualquer outro
+    objeto levantam `TypeError`: NUNCA viram nome de repositório (antes caíam no DORY_HF_REPO e
+    iniciavam um motor vLLM real). Em `generate`, o erro aciona o fallback HF quando permitido.
+    """
+    if isinstance(obj, str):
+        if not obj.strip():
+            raise ValueError("Nome de modelo vazio para o backend vLLM.")
+        return obj
+    is_hf_model = (torch is not None and isinstance(obj, torch.nn.Module)) and hasattr(obj, "config")
+    if not is_hf_model:
+        raise TypeError(
+            f"O backend vLLM precisa de uma str (repo/caminho), de um motor vLLM ou de um modelo HF; "
+            f"recebeu {type(obj).__name__}, que não pode ser usado como nome de modelo."
+        )
+    name = getattr(getattr(obj, "config", None), "_name_or_path", None) or getattr(obj, "name_or_path", None)
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(
+            "Modelo HF sem `config._name_or_path`: não há como dizer ao vLLM qual checkpoint carregar. "
+            "Passe o nome do repositório (str) em vez do objeto do modelo."
+        )
+    if os.path.isdir(name) or _HF_REPO_ID_RE.match(name):
+        return name
+    raise ValueError(
+        f"`config._name_or_path`={name!r} não é um repo 'org/nome' nem um diretório existente; "
+        "passe o nome do repositório (str) para o vLLM."
+    )
+
+
 _CACHED_VLLM_ENGINE: tuple[tuple[Any, ...], Any] | None = None
 
 
@@ -883,20 +918,16 @@ def _generate_vllm(
     """
     # Support in-memory engine instances or normal in-process execution when not using fake_vllm/subprocess_runner
     if _is_vllm_engine_instance(vllm_engine_or_model_name) or (subprocess_runner is None and not fake_vllm):
+        if not _is_vllm_engine_instance(vllm_engine_or_model_name):
+            # Valida o nome ANTES de importar o vllm/tocar a GPU: callables e mocks falham aqui (TypeError).
+            model_name = _resolve_vllm_model_name(vllm_engine_or_model_name)
         from vllm import SamplingParams  # type: ignore[import-not-found]
 
         if _is_vllm_engine_instance(vllm_engine_or_model_name):
             llm = vllm_engine_or_model_name
         else:
             evict_hf_models_from_gpu(vllm_engine_or_model_name)
-            if isinstance(vllm_engine_or_model_name, str):
-                model_name = vllm_engine_or_model_name
-            else:
-                model_name = (
-                    getattr(getattr(vllm_engine_or_model_name, "config", None), "_name_or_path", None)
-                    or getattr(vllm_engine_or_model_name, "name_or_path", None)
-                    or DORY_HF_REPO
-                )
+            if not isinstance(vllm_engine_or_model_name, str):
                 if n_loops is None:
                     n_loops = getattr(
                         getattr(vllm_engine_or_model_name, "config", None), "n_recurrent_loops", None
@@ -979,16 +1010,10 @@ def _generate_vllm(
                 )
         return results_direct
 
+    model_name = _resolve_vllm_model_name(vllm_engine_or_model_name)  # antes de tocar a GPU
     evict_hf_models_from_gpu(vllm_engine_or_model_name)
 
-    if isinstance(vllm_engine_or_model_name, str):
-        model_name = vllm_engine_or_model_name
-    else:
-        model_name = (
-            getattr(getattr(vllm_engine_or_model_name, "config", None), "_name_or_path", None)
-            or getattr(vllm_engine_or_model_name, "name_or_path", None)
-            or DORY_HF_REPO
-        )
+    if not isinstance(vllm_engine_or_model_name, str):
         if n_loops is None:
             n_loops = getattr(
                 getattr(vllm_engine_or_model_name, "config", None), "n_recurrent_loops", None

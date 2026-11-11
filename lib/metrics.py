@@ -232,39 +232,207 @@ def check_phase_gate(
     }
 
 
+# Taxa de consumo da A100 no Colab (CU/h) medida no run real; era 12.0 (errado) na versão anterior.
+DEFAULT_CU_PER_HOUR = 8.88
+
+# Camadas ("blocos") por parte do Dory: entrada + recorrente x loops + saída. Custo por token ~ 8 + 20*k + 8.
+DORY_COST_BLOCKS_INPUT = 8
+DORY_COST_BLOCKS_RECURRENT = 20
+DORY_COST_BLOCKS_OUTPUT = 8
+
+# Número de itens por benchmark (os mesmos usados em scripts/f0_smoke_and_estimate.py antes da reescrita).
+DEFAULT_ITEMS_PER_BENCH: dict[str, int] = {
+    "humaneval+": 164,
+    "mbpp+": 378,
+    "lcb_v6_quick": 200,
+    "lcb_v6_full": 880,
+    "scicode": 288,
+}
+# Quais benchmarks entram em cada tier (eval_quick / eval_gate, como em lib/evals.py).
+EVAL_TIER_BENCHES: dict[str, tuple[str, ...]] = {
+    "quick": ("humaneval+", "lcb_v6_quick"),
+    "gate": ("humaneval+", "mbpp+", "lcb_v6_full", "scicode"),
+}
+# Grupo de tokens/item: o smoke mede HumanEval+ ("simple") e LCB ("hard"); MBPP+ herda o primeiro e
+# SciCode herda o segundo (SciCode não roda no smoke: PREMISSA, não medida).
+BENCH_TOKEN_GROUP: dict[str, str] = {
+    "humaneval+": "simple",
+    "mbpp+": "simple",
+    "lcb_v6_quick": "hard",
+    "lcb_v6_full": "hard",
+    "scicode": "hard",
+}
+
+
+def loop_compute_factor(
+    n_loops: int,
+    *,
+    ref_loops: int = 2,
+    n_input: int = DORY_COST_BLOCKS_INPUT,
+    n_recurrent: int = DORY_COST_BLOCKS_RECURRENT,
+    n_output: int = DORY_COST_BLOCKS_OUTPUT,
+) -> float:
+    """Custo relativo de computação por token com `n_loops` loops, normalizado em `ref_loops` (k=2):
+    `(8 + 20*k + 8) / (8 + 20*2 + 8)`  ->  k=1: 0.643, k=2: 1.0, k=4: 1.714."""
+    if n_loops < 1 or ref_loops < 1:
+        raise ValueError("n_loops e ref_loops devem ser >= 1")
+    return (n_input + n_recurrent * n_loops + n_output) / float(n_input + n_recurrent * ref_loops + n_output)
+
+
+def measure_smoke_throughput(smoke_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Extrai de `eval_quick(smoke=True, smoke_n=N)` o throughput AGREGADO e os tokens médios por item.
+
+    Em cada benchmark, as N respostas saem de UMA chamada em lote ao vLLM, e `latency_mean_s` é o tempo de
+    parede dessa chamada dividido por N (o carregamento do motor fica fora dessa medida). Logo:
+    `tokens_totais = tokens_total_mean * N`, `tempo_de_parede = latency_mean_s * N` e
+    `throughput = soma(tokens_totais) / soma(tempo_de_parede)` em tokens/s. Retorna também
+    `mean_tokens` por grupo ("simple" = HumanEval+, "hard" = LCB) e a fração de respostas truncadas.
+    """
+    per_bench: dict[str, dict[str, float]] = {}
+    tot_tokens = 0.0
+    tot_wall = 0.0
+    for bench, res in smoke_results.items():
+        n = int((res.get("config") or {}).get("n_problems") or res.get("n_problems") or 0)
+        if n <= 0:
+            raise ValueError(f"Resultado de smoke de '{bench}' sem n_problems; não dá para medir throughput.")
+        tokens = float(res["tokens_total_mean"]) * n
+        wall = float(res["latency_mean_s"]) * n
+        per_bench[bench] = {
+            "n": n,
+            "tokens_total": tokens,
+            "wall_s": wall,
+            "tokens_per_s": tokens / wall if wall > 0 else 0.0,
+            "mean_tokens": float(res["tokens_total_mean"]),
+            "truncated_frac": res.get("truncated_frac"),
+        }
+        tot_tokens += tokens
+        tot_wall += wall
+    if tot_wall <= 0 or tot_tokens <= 0:
+        raise ValueError("Smoke sem tokens ou sem tempo medido; não dá para estimar throughput.")
+    mean_tokens: dict[str, float] = {}
+    for group in ("simple", "hard"):
+        rows = [b for name, b in per_bench.items() if BENCH_TOKEN_GROUP.get(name) == group]
+        n_group = sum(r["n"] for r in rows)
+        if n_group:
+            mean_tokens[group] = sum(r["tokens_total"] for r in rows) / n_group
+    return {
+        "per_bench": per_bench,
+        "throughput_tps": tot_tokens / tot_wall,
+        "total_tokens": tot_tokens,
+        "total_wall_s": tot_wall,
+        "mean_tokens": mean_tokens,
+    }
+
+
 def estimate_compute_cost(
     *,
-    smoke_elapsed_s: float,
-    smoke_n_items: int,
-    full_n_items: int,
-    cu_per_hour: float = 12.0,
+    mean_tokens: dict[str, float],
+    throughput_tps: float,
+    cu_per_hour: float = DEFAULT_CU_PER_HOUR,
     confirm_threshold_cu: float = 30.0,
+    items_per_bench: dict[str, int] | None = None,
+    dory_loops: tuple[int, ...] = (1, 2, 4),
+    include_qwen: bool = True,
+    qwen_compute_factor: float = 1.0,
+    ref_loops: int = 2,
 ) -> dict[str, Any]:
-    """Estimate wall-clock time and Colab Compute Units (CU) from a smoke run (Section 5, Rule 6).
-    A100 consumes ~11-13 CU/h (default 12.0 CU/h). Prints the estimate and flags if > 30 CU.
+    """Estima tempo e Compute Units (CU) do F0 completo por TOKENS e THROUGHPUT AGREGADO.
+
+    Não extrapola tempo serial por item (isso superestimava ~10x, pois no run real o vLLM processa lotes
+    de 128 em paralelo). Em vez disso, para cada configuração:
+        tokens = soma_bench( tokens_medios_por_item[grupo] * n_itens[bench] )
+        segundos = tokens / (throughput_L2 / fator_loops(k))
+    com `fator_loops(k) = (8 + 20k + 8) / (8 + 20*2 + 8)` (custo por token proporcional à computação).
+    Configurações: Dory L1/L2/L4 em quick + gate; Qwen só em quick (`qwen_compute_factor` = custo relativo
+    por token do Qwen vs Dory L2, PREMISSA = 1.0).
+
+    Args:
+        mean_tokens: `{"simple": tokens/item de HumanEval+/MBPP+, "hard": tokens/item de LCB/SciCode}`,
+            medidos no smoke (ver `measure_smoke_throughput`).
+        throughput_tps: throughput agregado (tokens/s) do Dory com `ref_loops` loops, medido com um lote
+            de N prompts de uma vez.
+
+    ESTIMATIVA, não garantia. Premissas: tokens/item de L1/L4/Qwen = o medido em L2 (L1 e L4 podem pensar
+    mais/menos); MBPP+ herda o de HumanEval+ e SciCode o de LCB (não medidos); o throughput de um lote
+    pequeno (N=32) tende a ser MENOR que o de lotes de 128 (superestima o tempo), mas a cauda de respostas
+    longas (até `max_new_tokens`) num lote real pode tornar o tempo MAIOR (subestima). Prints e retorno
+    mostram também a estimativa só do `eval_quick`.
     """
-    if smoke_n_items <= 0:
-        raise ValueError("smoke_n_items must be > 0")
-    sec_per_item = smoke_elapsed_s / float(smoke_n_items)
-    est_seconds = sec_per_item * float(full_n_items)
-    est_hours = est_seconds / 3600.0
-    est_cu = est_hours * cu_per_hour
-    requires_confirmation = est_cu > confirm_threshold_cu
+    if throughput_tps <= 0:
+        raise ValueError("throughput_tps deve ser > 0")
+    for g in ("simple", "hard"):
+        if g not in mean_tokens or mean_tokens[g] < 0:
+            raise ValueError(f"mean_tokens precisa de '{g}' >= 0 (medido no smoke)")
+    items = dict(DEFAULT_ITEMS_PER_BENCH)
+    if items_per_bench:
+        items.update(items_per_bench)
+
+    def _tier_tokens(tier: str) -> float:
+        return sum(mean_tokens[BENCH_TOKEN_GROUP[b]] * items[b] for b in EVAL_TIER_BENCHES[tier])
+
+    configs: list[dict[str, Any]] = []
+    for k in dory_loops:
+        factor = loop_compute_factor(k, ref_loops=ref_loops)
+        for tier in ("quick", "gate"):
+            configs.append({"config": f"dory_L{k}", "tier": tier, "tokens": _tier_tokens(tier), "factor": factor})
+    if include_qwen:
+        configs.append(
+            {"config": "qwen", "tier": "quick", "tokens": _tier_tokens("quick"), "factor": float(qwen_compute_factor)}
+        )
+    for c in configs:
+        c["seconds"] = c["tokens"] * c["factor"] / float(throughput_tps)
+        c["hours"] = c["seconds"] / 3600.0
+        c["cu"] = c["hours"] * cu_per_hour
+
+    def _total(rows: list[dict[str, Any]]) -> dict[str, float]:
+        sec = sum(r["seconds"] for r in rows)
+        return {
+            "tokens": sum(r["tokens"] for r in rows),
+            "seconds": sec,
+            "hours": sec / 3600.0,
+            "cu": sec / 3600.0 * cu_per_hour,
+        }
+
+    total = _total(configs)
+    quick_only = _total([c for c in configs if c["tier"] == "quick"])
+    requires_confirmation = total["cu"] > confirm_threshold_cu
 
     print(
-        f"[Estimativa de Custo] Smoke: {smoke_n_items} itens em {smoke_elapsed_s:.1f}s "
-        f"({sec_per_item:.2f}s/item) -> Run completo ({full_n_items} itens): "
-        f"~{est_hours:.2f} h (~{est_cu:.1f} CU @ {cu_per_hour:.1f} CU/h)."
+        f"[Estimativa de Custo] (ESTIMATIVA por tokens / throughput agregado) "
+        f"throughput={throughput_tps:.0f} tok/s (L{ref_loops}), tokens/item: "
+        f"simples={mean_tokens['simple']:.0f}, difícil={mean_tokens['hard']:.0f}, {cu_per_hour:.2f} CU/h."
     )
+    for c in configs:
+        print(
+            f"  - {c['config']:8s} {c['tier']:5s}: {c['tokens'] / 1e6:7.2f} Mtok x{c['factor']:.2f} -> "
+            f"{c['hours']:6.2f} h ({c['cu']:6.1f} CU)"
+        )
+    print(f"  => eval_quick (todas as configs): ~{quick_only['hours']:.2f} h (~{quick_only['cu']:.1f} CU)")
+    print(f"  => F0 completo: ~{total['hours']:.2f} h (~{total['cu']:.1f} CU @ {cu_per_hour:.2f} CU/h)")
     if requires_confirmation:
         print(
-            f"[ATENÇÃO] Custo estimado ({est_cu:.1f} CU) excede o limite de {confirm_threshold_cu:.1f} CU! "
+            f"[ATENÇÃO] Custo estimado ({total['cu']:.1f} CU) excede o limite de {confirm_threshold_cu:.1f} CU! "
             "Confirme antes de iniciar o run completo."
         )
     return {
-        "sec_per_item": sec_per_item,
-        "estimated_seconds": est_seconds,
-        "estimated_hours": est_hours,
-        "estimated_cu": est_cu,
+        "method": "tokens_x_aggregate_throughput",
+        "is_estimate": True,
+        "cu_per_hour": cu_per_hour,
+        "throughput_tps_ref": throughput_tps,
+        "ref_loops": ref_loops,
+        "mean_tokens": dict(mean_tokens),
+        "items_per_bench": items,
+        "configs": configs,
+        "eval_quick_only": quick_only,
+        "total": total,
+        "estimated_seconds": total["seconds"],
+        "estimated_hours": total["hours"],
+        "estimated_cu": total["cu"],
         "requires_confirmation": requires_confirmation,
+        "assumptions": [
+            "tokens/item de L1, L4 e Qwen iguais aos medidos em L2",
+            "MBPP+ usa tokens/item de HumanEval+; SciCode usa os de LCB (não medidos no smoke)",
+            "custo por token proporcional a 8 + 20k + 8 blocos (normalizado em k=2); Qwen = Dory L2 x qwen_compute_factor",
+            "throughput de lote pequeno vs lotes de 128 e cauda de respostas longas podem mudar o tempo real",
+        ],
     }

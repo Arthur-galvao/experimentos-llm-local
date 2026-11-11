@@ -987,6 +987,33 @@ def _encode_plain(tok: Any, text: str) -> list[int]:
     return [int(x) for x in ids]
 
 
+def _load_vllm_tokenizer(model_name_or_path: str) -> tuple[Any | None, str | None, list[str]]:
+    """Carrega o tokenizer do vLLM tentando, em ordem, os caminhos conhecidos entre versões.
+
+    Ordem: `vllm.tokenizers` (get_tokenizer), `vllm.tokenizers.registry` (get_tokenizer e
+    cached_get_tokenizer) e, por último, o caminho antigo `vllm.transformers_utils.tokenizer`.
+    Em todos, a assinatura é `get_tokenizer(tokenizer_name, *args, trust_remote_code=..., revision=...)`
+    (vllm/tokenizers/registry.py, branch main). Retorna `(tokenizer | None, origem | None, erros)`.
+    """
+    import importlib
+
+    candidates = (
+        ("vllm.tokenizers", "get_tokenizer"),
+        ("vllm.tokenizers.registry", "get_tokenizer"),
+        ("vllm.tokenizers.registry", "cached_get_tokenizer"),
+        ("vllm.transformers_utils.tokenizer", "get_tokenizer"),  # caminho antigo
+    )
+    errors: list[str] = []
+    for mod_name, fn_name in candidates:
+        label = f"{mod_name}.{fn_name}"
+        try:
+            fn = getattr(importlib.import_module(mod_name), fn_name)
+            return fn(model_name_or_path, trust_remote_code=True), label, errors
+        except Exception as exc:  # noqa: BLE001 - qualquer falha => tenta o próximo caminho
+            errors.append(f"{label}: {type(exc).__name__}: {exc}")
+    return None, None, errors
+
+
 def verify_tokenizer_equivalence(
     model_name_or_path: str = DORY_HF_REPO,
     *,
@@ -998,6 +1025,9 @@ def verify_tokenizer_equivalence(
     """Tokenize the same 20 texts (code, English, spaces, newlines) with the HF tokenizer and
     the vLLM tokenizer and compare token IDs. If they diverge, retry with `fix_mistral_regex=True`
     so both produce identical token ID sequences.
+
+    Se o tokenizer do vLLM não puder ser carregado (nenhuma importação funciona), nada é comparado:
+    o relatório traz `verified=False` e `matched=None` (nunca `matched=True`).
     """
     global _DORY_FIX_MISTRAL_REGEX
     text_list = list(texts)
@@ -1010,13 +1040,26 @@ def verify_tokenizer_equivalence(
     if hf_tokenizer is None:
         hf_tokenizer = _load_hf(_DORY_FIX_MISTRAL_REGEX)
 
+    vllm_source = "provided" if vllm_tokenizer is not None else None
+    vllm_import_errors: list[str] = []
     if vllm_tokenizer is None:
-        try:
-            from vllm.transformers_utils.tokenizer import get_tokenizer as _vllm_get_tok  # type: ignore[import-not-found]
+        vllm_tokenizer, vllm_source, vllm_import_errors = _load_vllm_tokenizer(model_name_or_path)
 
-            vllm_tokenizer = _vllm_get_tok(model_name_or_path, trust_remote_code=True)
-        except Exception:
-            vllm_tokenizer = _load_hf(None)
+    if vllm_tokenizer is None:
+        # Sem tokenizer do vLLM não há o que comparar: comparar o HF com ele mesmo reportaria
+        # `matched=True` falsamente. Reporta explicitamente "não verificado".
+        return {
+            "n_texts": len(text_list),
+            "verified": False,
+            "matched": None,
+            "divergences_initial": None,
+            "divergences_final": None,
+            "fix_mistral_regex": bool(_DORY_FIX_MISTRAL_REGEX),
+            "details": [],
+            "tokenizer": hf_tokenizer,
+            "vllm_tokenizer_source": None,
+            "vllm_import_errors": vllm_import_errors,
+        }
 
     def _compare(tok_a: Any, tok_b: Any) -> list[dict[str, Any]]:
         diffs: list[dict[str, Any]] = []
@@ -1057,13 +1100,55 @@ def verify_tokenizer_equivalence(
 
     return {
         "n_texts": len(text_list),
+        "verified": True,
         "matched": len(final_diffs) == 0,
         "divergences_initial": len(initial_diffs),
         "divergences_final": len(final_diffs),
         "fix_mistral_regex": fix_used,
         "details": final_diffs,
         "tokenizer": hf_tokenizer,
+        "vllm_tokenizer_source": vllm_source,
+        "vllm_import_errors": vllm_import_errors,
     }
+
+
+def format_tokenizer_report(report: dict[str, Any]) -> str:
+    """Resume em uma linha o relatório de `verify_tokenizer_equivalence`, deixando claro quando
+    a verificação NÃO foi feita (`verified=False`) em vez de exibir um `matched` enganoso.
+    """
+    if not report.get("verified", True):
+        erros = "; ".join(report.get("vllm_import_errors") or []) or "sem detalhes"
+        return (
+            f"[Tokenizer] {report['n_texts']} textos | verified=False | matched=None | "
+            "AVISO: tokenizer do vLLM indisponível, NADA foi comparado (HF vs vLLM NÃO verificado). "
+            f"Erros de importação: {erros}"
+        )
+    return (
+        f"[Tokenizer] {report['n_texts']} textos | verified=True | matched={report['matched']} | "
+        f"divergências iniciais={report['divergences_initial']} | finais={report['divergences_final']} | "
+        f"fix_mistral_regex={report['fix_mistral_regex']} | origem vLLM={report.get('vllm_tokenizer_source')}"
+    )
+
+
+def enforce_tokenizer_report(report: dict[str, Any]) -> None:
+    """Imprime o relatório de `verify_tokenizer_equivalence` e aplica a política dos scripts:
+    - `verified=False`: só avisa (não aborta), pois o tokenizer do vLLM não pôde ser comparado;
+    - `verified=True` e `matched=False`: levanta `SystemExit` com mensagem clara (HF e vLLM divergem);
+    - `verified=True` e `matched=True`: segue normalmente.
+    """
+    print(format_tokenizer_report(report))
+    if not report.get("verified", True):
+        print(
+            "[AVISO] Equivalência de tokenizer HF vs vLLM NÃO verificada (verified=False); "
+            "o run segue, mas a contagem de tokens de CoT depende dessa equivalência."
+        )
+        return
+    if report.get("matched") is False:
+        raise SystemExit(
+            "[ERRO] Tokenizer do HF e do vLLM produzem IDs diferentes "
+            f"({report.get('divergences_final')} textos divergentes mesmo após fix_mistral_regex). "
+            "Abortando para não gerar métricas inconsistentes."
+        )
 
 
 def load_dory(
@@ -1128,7 +1213,7 @@ def logit_lens_per_loop(
     n_loops: int = 4,
     top_k: int = 5,
     last_n_positions: int = 5,
-    apply_output_block: bool = False,
+    apply_output_block: bool = True,
 ) -> list[dict[str, Any]]:
     """Project intermediate hidden states at the end of each recurrent loop (`1..n_loops`)
     onto `lm_head` to inspect how top-k token predictions evolve across loops for the last
@@ -1141,9 +1226,12 @@ def logit_lens_per_loop(
         n_loops: Number of recurrent loops to run (default 4).
         top_k: Number of top tokens to extract per position and loop (default 5).
         last_n_positions: Number of trailing sequence positions to inspect (default 5).
-        apply_output_block: If True, pass each loop's hidden state through `output_layers`
-            before projecting onto `lm_head`; if False (classic Logit Lens), project the
-            loop's output hidden state directly onto `lm_head`.
+        apply_output_block: Padrão `True`. Passa o estado de cada loop pelas camadas de saída
+            (Output layers, `layers[n_in + n_rec:]`) — com os mesmos `position_ids`, `loop_idx=0`,
+            `is_last_loop=True`, `past_seen_tokens=0` e sem máscara/cache que `DoryModel.forward` usa —
+            antes do `lm_head`. Assim, no último loop o top-1 coincide com o do forward normal. Com
+            `False`, projeta o estado do loop direto no `lm_head`; isso mostra lixo, pois os estados
+            intermediários não estão no espaço de saída.
 
     Returns:
         A list of dicts (one per loop `1..n_loops`), each containing `loop_idx` and `positions`
@@ -1181,7 +1269,15 @@ def logit_lens_per_loop(
             h_proj = state
             if apply_output_block:
                 for out_layer in model.backbone.layers[n_in + n_rec :]:
-                    h_proj = out_layer(h_proj, position_ids=pos_ids, past_key_values=None)
+                    h_proj = out_layer(
+                        h_proj,
+                        position_ids=pos_ids,
+                        past_key_values=None,
+                        loop_idx=0,
+                        is_last_loop=True,
+                        past_seen_tokens=0,
+                        attention_mask=None,
+                    )
 
             logits = model.lm_head(h_proj[:, pos_indices, :])  # [1, n_pos, vocab]
             probs = F.softmax(logits.float(), dim=-1)
@@ -1518,7 +1614,7 @@ if not _HAS_TORCH:  # pragma: no cover
         n_loops: int = 4,
         top_k: int = 5,
         last_n_positions: int = 5,
-        apply_output_block: bool = False,
+        apply_output_block: bool = True,  # ignorado neste fallback sem torch
     ) -> list[dict[str, Any]]:
         if isinstance(prompt, str):
             enc = tokenizer(prompt)
