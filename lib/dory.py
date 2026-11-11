@@ -267,10 +267,17 @@ class DoryRotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # q, k: [batch, seq, heads, head_dim]
         # position_ids: [batch, seq]
+        # inv_freq é recalculado a cada chamada (barato) em vez de vir do buffer: no transformers 5.x,
+        # buffers não persistentes ficam com lixo após from_pretrained (inicialização em meta device),
+        # o que desligava o RoPE silenciosamente.
+        inv_freq = 1.0 / (
+            self.theta
+            ** (torch.arange(0, self.dim, 2, device=q.device, dtype=torch.int64).float() / self.dim)
+        )
         freqs = torch.einsum(
             "bs,d->bsd",
             position_ids.float(),
-            self.inv_freq.to(device=q.device, dtype=torch.float32),
+            inv_freq,
         )
         cos = freqs.cos().unsqueeze(2)  # [batch, seq, 1, head_dim // 2]
         sin = freqs.sin().unsqueeze(2)
@@ -1527,33 +1534,30 @@ def verify_vllm_hf_equivalence(
     loops: tuple[int, ...] = (1, 2, 4),
     max_new_tokens: int = 32,
     max_divergence_rate: float = 0.02,
-    gpu_memory_utilization: float = 0.45,
     model_name_or_path: str = DORY_HF_REPO,
     hf_model: Any | None = None,
     tokenizer: Any | None = None,
     vllm_runner: Any | None = None,
     hf_runner: Any | None = None,
-    subprocess_runner: Any | None = None,
-    fake_vllm: bool = False,
     output_json_path: str | None = None,
     halt_on_failure: bool = True,
 ) -> dict[str, Any]:
     """Mandatory Equivalence Test between official vLLM PR #60149 and our HF `DoryForCausalLM`.
 
-    Runs each loop count `k` in `loops` (default 1, 2, and 4) in an isolated subprocess
-    that saves its greedy trajectory and logprobs to a temporary JSON file and exits so
-    VRAM is completely freed after each loop count. The main process only reads the JSON.
-    The HF model is loaded ONLY after all vLLM subprocesses have finished.
+    Runs `len(prompts)` (default 5) prompts with `loops` (default 1, 2, and 4) for `max_new_tokens`
+    (default 32) greedy tokens, comparing the logprobs and top-1 predicted tokens at every position
+    under the exact same input prefix (teacher-forced along the vLLM greedy trajectory) as well as
+    free-running rollout agreement.
+
+    If top-1 diverges in more than `max_divergence_rate` (~2%) of positions, prints the exact
+    divergent positions and raises `RuntimeError` (when `halt_on_failure=True`).
     """
     import gc
-    import inspect
     import json
     from pathlib import Path
 
-    from .gen import build_dory_hf_overrides, evict_hf_models_from_gpu, run_vllm_in_subprocess
-
     prompt_list = list(prompts)
-    if tokenizer is None and _HAS_TORCH and vllm_runner is None and not fake_vllm:
+    if tokenizer is None and _HAS_TORCH and vllm_runner is None:
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -1578,77 +1582,84 @@ def verify_vllm_hf_equivalence(
                 pass
         formatted_prompts.append(p)
 
-    # Ensure no HF model is on GPU before any vLLM subprocess starts
-    hf_orig_device = None
-    if hf_model is not None and _HAS_TORCH and hasattr(hf_model, "parameters"):
-        try:
-            hf_orig_device = next(hf_model.parameters()).device
-            if hf_orig_device.type == "cuda":
-                hf_model.to("cpu")
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-    evict_hf_models_from_gpu(hf_model)
-
-    # Step 1: Collect vLLM trajectories & logprobs for each loop count k in a separate subprocess
+    # Step 1: Collect vLLM trajectories & logprobs for each loop count k in `loops`
+    # vllm_data[k] -> list (per prompt) of {"prompt_token_ids": [...], "steps": [{"top1_id", "top1_logprob"}, ...]}
     vllm_data: dict[int, list[dict[str, Any]]] = {}
-    vllm_subprocess_pids: dict[int, int] = {}
-    execution_order: list[str] = []
 
-    for k in loops:
-        k_int = int(k)
-        print(
-            f"[Equivalence] Rodando vLLM oficial em subprocesso isolado com n_recurrent_loops={k_int} "
-            f"em {len(formatted_prompts)} prompts..."
-        )
-        req_payload = {
-            "mode": "equivalence",
-            "model_name": model_name_or_path,
-            "prompts": formatted_prompts,
-            "max_new_tokens": int(max_new_tokens),
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "n_samples": 1,
-            "seed": 42,
-            "logprobs": 5,
-            "n_loops": k_int,
-            "hf_overrides": build_dory_hf_overrides(n_loops=k_int, recurrent_kv_cache_mode="per_loop"),
-            "gpu_memory_utilization": float(gpu_memory_utilization),
-            "max_model_len": 4096,
-            "fake_vllm": bool(fake_vllm or (vllm_runner is not None)),
-        }
+    if vllm_runner is not None:
+        for k in loops:
+            vllm_data[int(k)] = vllm_runner(formatted_prompts, int(k), int(max_new_tokens))
+    else:
+        from vllm import LLM, SamplingParams  # type: ignore[import-not-found]
 
-        active_subproc_runner = subprocess_runner
-        if active_subproc_runner is None and callable(vllm_runner):
-            sig = inspect.signature(vllm_runner)
-            if len(sig.parameters) == 2:
-                active_subproc_runner = vllm_runner
-            else:
-                def _wrapped_runner(in_json: Path, out_json: Path, _k: int = k_int) -> None:
-                    # Spawn a real child subprocess first to guarantee process isolation & distinct PID
-                    child_res = run_vllm_in_subprocess(
-                        json.loads(in_json.read_text(encoding="utf-8")),
-                        subprocess_runner=None,
+        # If hf_model is currently on GPU, move it to CPU temporarily so vLLM can allocate KV cache
+        hf_orig_device = None
+        if hf_model is not None and _HAS_TORCH and hasattr(hf_model, "parameters"):
+            try:
+                hf_orig_device = next(hf_model.parameters()).device
+                if hf_orig_device.type == "cuda":
+                    hf_model.to("cpu")
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        for k in loops:
+            print(f"[Equivalence] Rodando vLLM oficial com n_recurrent_loops={k} em {len(formatted_prompts)} prompts...")
+            llm = LLM(
+                model=model_name_or_path,
+                trust_remote_code=True,
+                dtype="bfloat16",
+                hf_overrides={"n_recurrent_loops": int(k)},
+                gpu_memory_utilization=0.80,
+                max_model_len=4096,
+                seed=42,
+            )
+            sp = SamplingParams(
+                temperature=0.0,
+                top_p=1.0,
+                max_tokens=int(max_new_tokens),
+                logprobs=5,
+                seed=42,
+            )
+            outs = llm.generate(formatted_prompts, sp)
+            loop_items: list[dict[str, Any]] = []
+            for req_out in outs:
+                p_ids = list(req_out.prompt_token_ids)
+                comp = req_out.outputs[0]
+                gen_ids = list(comp.token_ids)
+                step_list: list[dict[str, Any]] = []
+                for s_idx, tok_id in enumerate(gen_ids):
+                    lp_dict = comp.logprobs[s_idx] if (comp.logprobs and s_idx < len(comp.logprobs)) else {}
+                    if lp_dict and tok_id in lp_dict:
+                        raw_lp = lp_dict[tok_id]
+                        lp_val = float(raw_lp.logprob if hasattr(raw_lp, "logprob") else raw_lp)
+                    else:
+                        lp_val = 0.0
+                    step_list.append(
+                        {
+                            "top1_id": int(tok_id),
+                            "top1_logprob": lp_val,
+                        }
                     )
-                    custom_items = vllm_runner(formatted_prompts, _k, int(max_new_tokens))
-                    child_res["items"] = custom_items
-                    out_json.write_text(json.dumps(child_res, ensure_ascii=False), encoding="utf-8")
+                loop_items.append(
+                    {
+                        "prompt_token_ids": p_ids,
+                        "generated_token_ids": gen_ids,
+                        "steps": step_list,
+                    }
+                )
+            vllm_data[int(k)] = loop_items
 
-                active_subproc_runner = _wrapped_runner
+            # Clean up vLLM instance before next loop count
+            del llm
+            gc.collect()
+            if _HAS_TORCH and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        worker_out = run_vllm_in_subprocess(
-            req_payload,
-            subprocess_runner=active_subproc_runner,
-        )
-        vllm_data[k_int] = list(worker_out["items"])
-        vllm_subprocess_pids[k_int] = int(worker_out.get("pid", -1))
-        execution_order.append(f"vllm_loop_{k_int}")
+        if hf_model is not None and hf_orig_device is not None and hf_orig_device.type == "cuda":
+            hf_model.to(hf_orig_device)
 
-    # Step 2: ONLY AFTER all vLLM subprocesses have terminated, load/run the HF reimplementation
-    execution_order.append("hf_load_and_eval")
-    if hf_model is not None and hf_orig_device is not None and hf_orig_device.type == "cuda":
-        hf_model.to(hf_orig_device)
-
+    # Step 2: Collect HF reimplementation logprobs on the exact same input sequence for each loop k
     hf_data: dict[int, list[list[dict[str, Any]]]] = {}
     if hf_runner is not None:
         for k in loops:
@@ -1766,8 +1777,6 @@ def verify_vllm_hf_equivalence(
         "total_divergences": total_divergences,
         "overall_divergence_rate": round(overall_rate, 6),
         "overall_mean_abs_logprob_diff": round(overall_mean_diff, 6),
-        "vllm_subprocess_pids": vllm_subprocess_pids,
-        "execution_order": execution_order,
         "per_loop": per_loop_summary,
         "all_divergences": all_divergences,
     }

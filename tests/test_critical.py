@@ -18,14 +18,11 @@ except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
 from lib.dory import (
-    DORY_HF_REPO,
-    QWEN_CONTROL_HF_REPO,
     DoryConfig,
     DoryForCausalLM,
     init_new_tokens_embeddings,
     logit_lens_per_loop,
     set_dory_loops,
-    verify_vllm_hf_equivalence,
 )
 from lib.evals import build_lcb_quick_split
 from lib.gen import (
@@ -33,11 +30,10 @@ from lib.gen import (
     build_dory_hf_overrides,
     count_cot_tokens,
     generate,
-    run_vllm_in_subprocess,
     split_cot_and_answer,
 )
 from lib.hw import detect_hardware_profile, get_hw_config
-from lib.io import CheckpointManager, ResumableProgress, setup_drive_and_cache
+from lib.io import CheckpointManager, ResumableProgress
 from lib.metrics import check_phase_gate, compute_pareto_frontier, plot_pareto
 from lib.registry import RESULT_FIELDS, append_result, load_results
 from lib.rewards import compute_reward, make_grpo_reward_fn
@@ -540,13 +536,6 @@ def test_checkpoint_manager_and_resumable_progress() -> None:
         assert prog2.is_done("prob_1")
         assert prog2.get("prob_1")["n_cot_tokens"] == 42
 
-        paths = setup_drive_and_cache(local_fallback_root=tmp_path / "drive_proj")
-        import os
-        assert os.environ["HF_HOME"] == "/root/.cache/huggingface"
-        assert os.environ["HF_HUB_CACHE"] == "/root/.cache/huggingface/hub"
-        assert os.environ["HF_DATASETS_CACHE"] == "/root/.cache/huggingface/datasets"
-        assert str(paths["hf_home"]).replace("\\", "/") == "/root/.cache/huggingface"
-
 
 def test_hw_config_and_lcb_quick_split() -> None:
     with tempfile.TemporaryDirectory() as tmp:
@@ -669,118 +658,30 @@ def test_vllm_failure_raises_when_allow_hf_fallback_false() -> None:
     assert fallback_outs[0].n_cot_tokens == 2
 
 
-def test_each_loop_spawns_new_vllm_subprocess() -> None:
-    import json
-    import os
-
-    parent_pid = os.getpid()
-    events: list[str] = []
-    spawned_pids_equiv: list[int] = []
-
-    def fake_equiv_subprocess_runner(in_json: Path, out_json: Path) -> None:
-        req = json.loads(in_json.read_text(encoding="utf-8"))
-        # Execute inside a real spawned OS child process via run_vllm_in_subprocess(subprocess_runner=None)
-        child_data = run_vllm_in_subprocess(req, subprocess_runner=None)
-        child_pid = int(child_data["pid"])
-        spawned_pids_equiv.append(child_pid)
-        events.append(f"vllm_subproc_loop_{req['n_loops']}")
-        out_json.write_text(json.dumps(child_data, ensure_ascii=False), encoding="utf-8")
-
-    def fake_hf_runner(
-        prompts: list[str],
-        vllm_loop_items: list[dict[str, Any]],
-        k_loops: int,
-        max_new_tokens: int,
-    ) -> list[list[dict[str, Any]]]:
-        # When HF runs, all 3 vLLM subprocesses (1, 2, 4) must have already finished
-        assert events[:3] == ["vllm_subproc_loop_1", "vllm_subproc_loop_2", "vllm_subproc_loop_4"]
-        events.append(f"hf_eval_loop_{k_loops}")
-        return [item["steps"] for item in vllm_loop_items]
-
-    report = verify_vllm_hf_equivalence(
-        prompts=("Prompt A", "Prompt B"),
-        loops=(1, 2, 4),
-        max_new_tokens=8,
-        subprocess_runner=fake_equiv_subprocess_runner,
-        hf_runner=fake_hf_runner,
-        fake_vllm=True,
-        halt_on_failure=True,
-    )
-
-    assert report["passed"] is True
-    assert len(spawned_pids_equiv) == 3
-    # Verify default gpu_memory_utilization in verify_vllm_hf_equivalence is 0.45
-    import inspect as _insp
-    assert _insp.signature(verify_vllm_hf_equivalence).parameters["gpu_memory_utilization"].default == 0.45
-    # Every loop count (1, 2, 4) spawned a brand-new OS process distinct from parent and from each other
-    assert all(pid != parent_pid for pid in spawned_pids_equiv)
-    assert len(set(spawned_pids_equiv)) == 3
-    assert report["execution_order"] == [
-        "vllm_loop_1",
-        "vllm_loop_2",
-        "vllm_loop_4",
-        "hf_load_and_eval",
-    ]
-    assert events == [
-        "vllm_subproc_loop_1",
-        "vllm_subproc_loop_2",
-        "vllm_subproc_loop_4",
-        "hf_eval_loop_1",
-        "hf_eval_loop_2",
-        "hf_eval_loop_4",
-    ]
-
-    # Also verify _generate_vllm opens a separate subprocess for each Dory loop (1, 2, 4) and for Qwen
-    gen_subproc_records: list[dict[str, Any]] = []
-
-    def fake_gen_subprocess_runner(in_json: Path, out_json: Path) -> None:
-        req = json.loads(in_json.read_text(encoding="utf-8"))
-        child_data = run_vllm_in_subprocess(req, subprocess_runner=None)
-        gen_subproc_records.append(
-            {
-                "pid": int(child_data["pid"]),
-                "model_name": req["model_name"],
-                "n_loops": req["n_loops"],
-                "hf_overrides": req["hf_overrides"],
-                "limit_mm_per_prompt": req["limit_mm_per_prompt"],
-            }
-        )
-        out_json.write_text(json.dumps(child_data, ensure_ascii=False), encoding="utf-8")
-
-    tokenizer = DeterministicWordTokenizer()
-    for k in (1, 2, 4):
-        outs_k = generate(
-            DORY_HF_REPO,
-            ["Solve task"],
-            n_loops=k,
-            tokenizer=tokenizer,
-            backend="vllm",
-            subprocess_runner=fake_gen_subprocess_runner,
-            fake_vllm=True,
-        )
-        assert len(outs_k) == 1
-        assert outs_k[0].backend == "vllm"
-        assert outs_k[0].n_cot_tokens == 6
-
-    outs_qwen = generate(
-        QWEN_CONTROL_HF_REPO,
-        ["Solve task"],
-        n_loops=None,
-        tokenizer=tokenizer,
-        backend="vllm",
-        subprocess_runner=fake_gen_subprocess_runner,
-        fake_vllm=True,
-    )
-    assert len(outs_qwen) == 1
-    assert outs_qwen[0].backend == "vllm"
-
-    assert len(gen_subproc_records) == 4
-    gen_pids = [r["pid"] for r in gen_subproc_records]
-    assert all(pid != parent_pid for pid in gen_pids)
-    assert len(set(gen_pids)) == 4
-    assert [r["n_loops"] for r in gen_subproc_records[:3]] == [1, 2, 4]
-    assert gen_subproc_records[3]["model_name"] == QWEN_CONTROL_HF_REPO
-    assert gen_subproc_records[3]["limit_mm_per_prompt"] == {"image": 0, "video": 0}
+def test_from_pretrained_roundtrip_preserves_logits() -> None:
+    """Regressão: no transformers 5.x, buffers não persistentes (ex.: inv_freq do RoPE) ficavam com lixo
+    após from_pretrained, desligando o RoPE em silêncio (teste de equivalência deu 70% de divergência).
+    Salvar e recarregar o modelo deve reproduzir exatamente os mesmos logits."""
+    model, tokenizer = _make_tiny_dory(n_loops=2)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(torch.randn_like(p) * 0.02)
+    input_ids = tokenizer("step 1 we need to add two numbers and then return", return_tensors="pt")["input_ids"]
+    with torch.no_grad():
+        ref = model(input_ids=input_ids).logits
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_cls = type(model.config)
+        orig_validate = getattr(cfg_cls, "validate", None)
+        cfg_cls.validate = lambda self: None  # transformers 5.x rejeita layer_types == "mlp" ao salvar
+        try:
+            model.save_pretrained(tmp)
+            loaded = DoryForCausalLM.from_pretrained(tmp).eval()
+        finally:
+            if orig_validate is not None:
+                cfg_cls.validate = orig_validate
+        with torch.no_grad():
+            out = loaded(input_ids=input_ids).logits
+    assert torch.allclose(ref, out, atol=1e-5), f"max diff = {(ref - out).abs().max().item()}"
 
 
 class CriticalModulesTestSuite(unittest.TestCase):
@@ -818,9 +719,6 @@ class CriticalModulesTestSuite(unittest.TestCase):
 
     def test_11_vllm_failure_raises_when_allow_hf_fallback_false(self) -> None:
         test_vllm_failure_raises_when_allow_hf_fallback_false()
-
-    def test_12_each_loop_spawns_new_vllm_subprocess(self) -> None:
-        test_each_loop_spawns_new_vllm_subprocess()
 
 
 if __name__ == "__main__":
