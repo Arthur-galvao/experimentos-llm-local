@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_DRIVE_ROOT = "/content/drive/MyDrive/coder-comprimido"
+DEFAULT_LOCAL_HF_HOME = "/root/.cache/huggingface"
 
 
 def is_colab() -> bool:
@@ -26,12 +27,12 @@ def setup_drive_and_cache(
     local_fallback_root: str | Path | None = None,
     mount_point: str = "/content/drive",
 ) -> dict[str, Path]:
-    """Mount Google Drive if running on Colab, create standard subdirectories,
-    and configure HF_HOME on persistent storage to avoid re-downloading models/datasets.
+    """Mount Google Drive if running on Colab, create standard subdirectories on Drive,
+    and configure HuggingFace cache in local disk (`/root/.cache/huggingface`).
 
     Returns a dictionary of resolved directory paths:
         - root: base persistent directory
-        - hf_home: HuggingFace cache dir
+        - hf_home: HuggingFace local cache dir (`/root/.cache/huggingface`)
         - checkpoints: model/training checkpoints dir
         - eval_cache: per-problem evaluation resume cache dir
         - results: results dir (containing results.jsonl and plots/)
@@ -49,19 +50,23 @@ def setup_drive_and_cache(
         else:
             base_dir = Path.cwd().resolve()
 
-    hf_home = base_dir / "hf_cache"
+    hf_home = Path(DEFAULT_LOCAL_HF_HOME)
     checkpoints_dir = base_dir / "checkpoints"
     eval_cache_dir = base_dir / "eval_cache"
     results_dir = base_dir / "results"
     plots_dir = results_dir / "plots"
     data_dir = base_dir / "data"
 
-    for d in (base_dir, hf_home, checkpoints_dir, eval_cache_dir, results_dir, plots_dir, data_dir):
+    for d in (base_dir, checkpoints_dir, eval_cache_dir, results_dir, plots_dir, data_dir):
         d.mkdir(parents=True, exist_ok=True)
+    try:
+        hf_home.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
 
-    os.environ["HF_HOME"] = str(hf_home)
-    os.environ["HF_HUB_CACHE"] = str(hf_home / "hub")
-    os.environ["HF_DATASETS_CACHE"] = str(hf_home / "datasets")
+    os.environ["HF_HOME"] = DEFAULT_LOCAL_HF_HOME
+    os.environ["HF_HUB_CACHE"] = f"{DEFAULT_LOCAL_HF_HOME}/hub"
+    os.environ["HF_DATASETS_CACHE"] = f"{DEFAULT_LOCAL_HF_HOME}/datasets"
 
     return {
         "root": base_dir,

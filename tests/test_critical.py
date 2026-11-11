@@ -37,7 +37,7 @@ from lib.gen import (
     split_cot_and_answer,
 )
 from lib.hw import detect_hardware_profile, get_hw_config
-from lib.io import CheckpointManager, ResumableProgress
+from lib.io import CheckpointManager, ResumableProgress, setup_drive_and_cache
 from lib.metrics import check_phase_gate, compute_pareto_frontier, plot_pareto
 from lib.registry import RESULT_FIELDS, append_result, load_results
 from lib.rewards import compute_reward, make_grpo_reward_fn
@@ -540,6 +540,13 @@ def test_checkpoint_manager_and_resumable_progress() -> None:
         assert prog2.is_done("prob_1")
         assert prog2.get("prob_1")["n_cot_tokens"] == 42
 
+        paths = setup_drive_and_cache(local_fallback_root=tmp_path / "drive_proj")
+        import os
+        assert os.environ["HF_HOME"] == "/root/.cache/huggingface"
+        assert os.environ["HF_HUB_CACHE"] == "/root/.cache/huggingface/hub"
+        assert os.environ["HF_DATASETS_CACHE"] == "/root/.cache/huggingface/datasets"
+        assert str(paths["hf_home"]).replace("\\", "/") == "/root/.cache/huggingface"
+
 
 def test_hw_config_and_lcb_quick_split() -> None:
     with tempfile.TemporaryDirectory() as tmp:
@@ -702,6 +709,9 @@ def test_each_loop_spawns_new_vllm_subprocess() -> None:
 
     assert report["passed"] is True
     assert len(spawned_pids_equiv) == 3
+    # Verify default gpu_memory_utilization in verify_vllm_hf_equivalence is 0.45
+    import inspect as _insp
+    assert _insp.signature(verify_vllm_hf_equivalence).parameters["gpu_memory_utilization"].default == 0.45
     # Every loop count (1, 2, 4) spawned a brand-new OS process distinct from parent and from each other
     assert all(pid != parent_pid for pid in spawned_pids_equiv)
     assert len(set(spawned_pids_equiv)) == 3

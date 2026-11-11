@@ -1527,6 +1527,7 @@ def verify_vllm_hf_equivalence(
     loops: tuple[int, ...] = (1, 2, 4),
     max_new_tokens: int = 32,
     max_divergence_rate: float = 0.02,
+    gpu_memory_utilization: float = 0.45,
     model_name_or_path: str = DORY_HF_REPO,
     hf_model: Any | None = None,
     tokenizer: Any | None = None,
@@ -1612,7 +1613,7 @@ def verify_vllm_hf_equivalence(
             "logprobs": 5,
             "n_loops": k_int,
             "hf_overrides": build_dory_hf_overrides(n_loops=k_int, recurrent_kv_cache_mode="per_loop"),
-            "gpu_memory_utilization": 0.80,
+            "gpu_memory_utilization": float(gpu_memory_utilization),
             "max_model_len": 4096,
             "fake_vllm": bool(fake_vllm or (vllm_runner is not None)),
         }
