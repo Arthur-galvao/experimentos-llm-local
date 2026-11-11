@@ -933,6 +933,40 @@ def test_tokenizer_20_texts_hf_vs_vllm_and_fix_mistral_regex() -> None:
     assert report["fix_mistral_regex"] is True
 
 
+def test_dory_cached_decode_matches_uncached() -> None:
+    """Regressão: o generate() do transformers 5.x não suportava o DoryLoopCache (erro de forma na
+    atenção). O laço próprio com cache deve gerar exatamente os mesmos tokens que a geração sem cache,
+    inclusive em lote com padding à esquerda."""
+    from lib.gen import _dory_decode
+
+    model, tokenizer = _make_tiny_dory(n_loops=2)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(torch.randn_like(p) * 0.02)
+    a = tokenizer("step 1 we need to add two numbers", return_tensors="pt")["input_ids"]
+    b = tokenizer("return the sum", return_tensors="pt")["input_ids"]
+    with torch.no_grad():
+        def _ref(x):
+            seq = x
+            for _ in range(8):
+                nxt = model(input_ids=seq, use_cache=False).logits[:, -1, :].argmax(-1, keepdim=True)
+                seq = torch.cat([seq, nxt], dim=1)
+            return seq[0, -8:].tolist()
+
+        ref_a, ref_b = _ref(a), _ref(b)
+        pad = a.shape[1] - b.shape[1]
+        batch = torch.cat([a, torch.cat([torch.zeros(1, pad, dtype=torch.long), b], 1)], 0)
+        mask = torch.cat(
+            [torch.ones_like(a), torch.cat([torch.zeros(1, pad, dtype=torch.long), torch.ones_like(b)], 1)], 0
+        )
+        out = _dory_decode(
+            model, batch, mask, max_new_tokens=8, temperature=0.0, top_p=1.0,
+            eos_ids=set(), pad_id=0, n_loops=None,
+        )
+    assert out[0, -8:].tolist() == ref_a
+    assert out[1, -8:].tolist() == ref_b
+
+
 class CriticalModulesTestSuite(unittest.TestCase):
     """Unittest wrapper so tests can also be run via `python -m unittest` if pytest is absent."""
 

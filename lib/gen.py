@@ -282,6 +282,89 @@ def format_chat_prompt(
     return f"{user_prompt}\n{THINK_OPEN}\n" if enable_thinking else f"{user_prompt}\n"
 
 
+
+def _eos_ids_for(model: Any, tokenizer: Any) -> set[int]:
+    ids: set[int] = set()
+    gc_eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    for src in (gc_eos, getattr(tokenizer, "eos_token_id", None)):
+        if isinstance(src, int):
+            ids.add(int(src))
+        elif isinstance(src, (list, tuple)):
+            ids.update(int(x) for x in src)
+    return ids
+
+
+def _dory_decode(
+    model: Any,
+    input_ids: Any,
+    attention_mask: Any,
+    *,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    eos_ids: set[int],
+    pad_id: int,
+    n_loops: int | None,
+) -> Any:
+    """Laço de decodificação próprio para o Dory, usando o `DoryLoopCache` diretamente.
+
+    O `model.generate()` do transformers 5.x cria e gerencia o próprio objeto de cache e não
+    reconhece o `DoryLoopCache`, o que quebrava as formas da atenção ao usar cache. Aqui o cache
+    é nosso do início ao fim. Suporta lote com padding à esquerda.
+    """
+    from .dory import DoryLoopCache
+
+    mode = getattr(model.config, "kv_cache_mode", None) or getattr(
+        model.config, "recurrent_kv_cache_mode", "per_loop"
+    )
+    cache = DoryLoopCache(mode=mode)
+    bsz = input_ids.shape[0]
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+    finished = torch.zeros(bsz, dtype=torch.bool, device=input_ids.device)
+    generated = []
+    cur_ids = input_ids
+    cur_mask = attention_mask
+    fwd_kwargs: dict[str, Any] = {}
+    if n_loops is not None:
+        fwd_kwargs["n_loops"] = int(n_loops)
+    eos_tensor = torch.tensor(sorted(eos_ids) or [-1], device=input_ids.device)
+
+    for _ in range(int(max_new_tokens)):
+        out = model(
+            input_ids=cur_ids,
+            attention_mask=cur_mask,
+            past_key_values=cache,
+            use_cache=True,
+            **fwd_kwargs,
+        )
+        cache = out.past_key_values
+        logits = out.logits[:, -1, :].float()
+        if temperature > 1e-5:
+            logits = logits / float(temperature)
+            probs = torch.softmax(logits, dim=-1)
+            if top_p < 1.0:
+                sorted_p, sorted_idx = torch.sort(probs, descending=True, dim=-1)
+                cum = torch.cumsum(sorted_p, dim=-1)
+                remove = (cum - sorted_p) > float(top_p)
+                sorted_p = sorted_p.masked_fill(remove, 0.0)
+                probs = torch.zeros_like(probs).scatter(-1, sorted_idx, sorted_p)
+                probs = probs / probs.sum(dim=-1, keepdim=True)
+            next_tok = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        else:
+            next_tok = torch.argmax(logits, dim=-1)
+        next_tok = torch.where(finished, torch.full_like(next_tok, pad_id), next_tok)
+        generated.append(next_tok)
+        finished = finished | torch.isin(next_tok, eos_tensor)
+        cur_ids = next_tok.unsqueeze(-1)
+        cur_mask = torch.cat([cur_mask, torch.ones((bsz, 1), dtype=cur_mask.dtype, device=cur_mask.device)], dim=-1)
+        if bool(finished.all()):
+            break
+
+    gen = torch.stack(generated, dim=1) if generated else input_ids[:, :0]
+    return torch.cat([input_ids, gen], dim=1)
+
+
 def _generate_hf(
     model: Any,
     prompts: list[str],
@@ -376,11 +459,25 @@ def _generate_hf(
                 torch.cuda.synchronize(device)
             t0 = time.perf_counter()
             with torch.no_grad():
-                out_ids = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    **gen_kwargs,
-                )
+                if hasattr(model, "backbone") and hasattr(getattr(model, "config", None), "n_recurrent_loops"):
+                    # Dory: laço próprio (o generate() do transformers 5.x não suporta o DoryLoopCache)
+                    out_ids = _dory_decode(
+                        model,
+                        input_ids,
+                        attention_mask,
+                        max_new_tokens=int(max_new_tokens),
+                        temperature=float(temperature),
+                        top_p=float(top_p),
+                        eos_ids=_eos_ids_for(model, tokenizer),
+                        pad_id=int(tokenizer.pad_token_id),
+                        n_loops=n_loops,
+                    )
+                else:
+                    out_ids = model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        **gen_kwargs,
+                    )
             if torch.cuda.is_available() and device.type == "cuda":
                 torch.cuda.synchronize(device)
             batch_elapsed = time.perf_counter() - t0
@@ -392,7 +489,8 @@ def _generate_hf(
                 eos_id = tokenizer.eos_token_id
                 pad_id = tokenizer.pad_token_id
                 token_list = gen_seq.tolist()
-                while token_list and token_list[-1] in (eos_id, pad_id):
+                stop_ids = _eos_ids_for(model, tokenizer) | {eos_id, pad_id}
+                while token_list and token_list[-1] in stop_ids:
                     token_list.pop()
                 n_total_tokens = len(token_list)
                 gen_text = tokenizer.decode(token_list, skip_special_tokens=False)
@@ -722,6 +820,8 @@ def _get_or_create_vllm_engine(
     hf_overrides: dict[str, Any],
     limit_mm_per_prompt: dict[str, int] | None,
     seed: int,
+    max_model_len: int | None = None,
+    gpu_memory_utilization: float = 0.90,
 ) -> Any:
     """Return a cached in-process `vllm.LLM` instance for `(model_name, n_loops, recurrent_kv_cache_mode)`
     so multiple batches of 128 problems within the same single-engine baseline subprocess reuse the engine.
@@ -751,6 +851,10 @@ def _get_or_create_vllm_engine(
         llm_kwargs["limit_mm_per_prompt"] = limit_mm_per_prompt
     if hf_overrides:
         llm_kwargs["hf_overrides"] = hf_overrides
+    # Sem max_model_len o vLLM usa o contexto máximo do modelo (256K) e reserva/escalona para isso.
+    if max_model_len is not None:
+        llm_kwargs["max_model_len"] = int(max_model_len)
+    llm_kwargs["gpu_memory_utilization"] = float(gpu_memory_utilization)
 
     llm = LLM(**llm_kwargs)
     _CACHED_VLLM_ENGINE = (engine_key, llm)
@@ -814,6 +918,7 @@ def _generate_vllm(
                 hf_overrides=hf_overrides_inproc,
                 limit_mm_per_prompt=limit_mm_inproc,
                 seed=seed,
+                max_model_len=int(max_new_tokens) + 4096,  # prompt (até ~4K tokens) + geração
             )
 
         tok_for_cot = tokenizer

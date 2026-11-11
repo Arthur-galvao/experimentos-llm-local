@@ -62,23 +62,40 @@ def _decode_lcb_test_cases(raw_field: Any) -> list[dict[str, str]]:
     return []
 
 
-def load_lcb_v6_dataset(version_tag: str = "release_v6") -> list[dict[str, Any]]:
-    """Load `livecodebench/code_generation_lite` (`release_v6`) from HuggingFace Datasets."""
-    from datasets import load_dataset  # type: ignore[import-not-found]
+_LCB_RELEASE_FILES: dict[str, list[str]] = {
+    "release_v1": ["test.jsonl"],
+    "release_v2": ["test.jsonl", "test2.jsonl"],
+    "release_v3": ["test.jsonl", "test2.jsonl", "test3.jsonl"],
+    "release_v4": ["test.jsonl", "test2.jsonl", "test3.jsonl", "test4.jsonl"],
+    "release_v5": ["test.jsonl", "test2.jsonl", "test3.jsonl", "test4.jsonl", "test5.jsonl"],
+    "release_v6": ["test.jsonl", "test2.jsonl", "test3.jsonl", "test4.jsonl", "test5.jsonl", "test6.jsonl"],
+}
 
-    try:
-        ds = load_dataset(
-            "livecodebench/code_generation_lite",
-            version_tag=version_tag,
-            split="test",
-            trust_remote_code=True,
-        )
-    except Exception:
-        ds = load_dataset(
-            "livecodebench/code_generation_lite",
-            version_tag,
-            split="test",
-        )
+
+def _iter_lcb_rows(version_tag: str):
+    """Lê os .jsonl do repositório `livecodebench/code_generation_lite` diretamente.
+
+    O `datasets` 4.x não executa mais scripts de carregamento (`code_generation_lite.py`), então
+    baixamos os arquivos que compõem a release (mesma tabela ALLOWED_FILES do script oficial).
+    """
+    import json as _json
+
+    from huggingface_hub import hf_hub_download  # type: ignore[import-not-found]
+
+    if version_tag not in _LCB_RELEASE_FILES:
+        raise ValueError(f"version_tag desconhecida: {version_tag}")
+    for fname in _LCB_RELEASE_FILES[version_tag]:
+        path = hf_hub_download("livecodebench/code_generation_lite", fname, repo_type="dataset")
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    yield _json.loads(line)
+
+
+def load_lcb_v6_dataset(version_tag: str = "release_v6") -> list[dict[str, Any]]:
+    """Load `livecodebench/code_generation_lite` (`release_v6`) lendo os .jsonl diretamente."""
+    ds = _iter_lcb_rows(version_tag)
 
     items: list[dict[str, Any]] = []
     for row in ds:
