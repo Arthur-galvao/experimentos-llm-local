@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 
-def _run_single_target(target: str, repo_root: Path) -> None:
+def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> None:
     from lib.dory import (
         DORY_HF_REPO,
         QWEN_CONTROL_HF_REPO,
@@ -39,46 +39,48 @@ def _run_single_target(target: str, repo_root: Path) -> None:
         enforce_tokenizer_report(verify_tokenizer_equivalence(DORY_HF_REPO))
         tok = load_dory_tokenizer(DORY_HF_REPO)
 
-        print(f"\n>>> [Subprocesso {target}] Executando eval_quick (vLLM, lotes de 128) para {run_id} (n_loops={k_loops})...")
-        eval_quick(
-            DORY_HF_REPO,
-            tok,
-            run_id=run_id,
-            phase="F0",
-            model_name=DORY_HF_REPO,
-            checkpoint="base",
-            n_loops=k_loops,
-            lcb_quick_path=lcb_quick_path,
-            max_new_tokens=16000,
-            temperature=1.0,
-            top_p=0.95,
-            seed=42,
-            backend="vllm",
-            batch_size=eval_hw_cfg["batch_size"],
-            cache_dir=eval_cache_dir,
-            results_path=results_jsonl,
-            smoke=False,
-        )
+        if scope in ("quick", "both"):
+            print(f"\n>>> [Subprocesso {target}] Executando eval_quick (vLLM, lotes de 128) para {run_id} (n_loops={k_loops})...")
+            eval_quick(
+                DORY_HF_REPO,
+                tok,
+                run_id=run_id,
+                phase="F0",
+                model_name=DORY_HF_REPO,
+                checkpoint="base",
+                n_loops=k_loops,
+                lcb_quick_path=lcb_quick_path,
+                max_new_tokens=16000,
+                temperature=1.0,
+                top_p=0.95,
+                seed=42,
+                backend="vllm",
+                batch_size=eval_hw_cfg["batch_size"],
+                cache_dir=eval_cache_dir,
+                results_path=results_jsonl,
+                smoke=False,
+            )
 
-        print(f"\n>>> [Subprocesso {target}] Executando eval_gate (vLLM, lotes de 128) para {run_id} (n_loops={k_loops})...")
-        eval_gate(
-            DORY_HF_REPO,
-            tok,
-            run_id=run_id,
-            phase="F0",
-            model_name=DORY_HF_REPO,
-            checkpoint="base",
-            n_loops=k_loops,
-            max_new_tokens=16000,
-            temperature=1.0,
-            top_p=0.95,
-            seed=42,
-            backend="vllm",
-            batch_size=eval_hw_cfg["batch_size"],
-            cache_dir=eval_cache_dir,
-            results_path=results_jsonl,
-            smoke=False,
-        )
+        if scope in ("gate", "both"):
+            print(f"\n>>> [Subprocesso {target}] Executando eval_gate (vLLM, lotes de 128) para {run_id} (n_loops={k_loops})...")
+            eval_gate(
+                DORY_HF_REPO,
+                tok,
+                run_id=run_id,
+                phase="F0",
+                model_name=DORY_HF_REPO,
+                checkpoint="base",
+                n_loops=k_loops,
+                max_new_tokens=16000,
+                temperature=1.0,
+                top_p=0.95,
+                seed=42,
+                backend="vllm",
+                batch_size=eval_hw_cfg["batch_size"],
+                cache_dir=eval_cache_dir,
+                results_path=results_jsonl,
+                smoke=False,
+            )
         print(f"\n=== {run_id}: CONCLUÍDO ===")
         return
 
@@ -166,6 +168,12 @@ def main() -> None:
         default=None,
         help="Baseline alvo ('L1', 'L2', 'L4', 'qwen', 'plot' ou 'all').",
     )
+    parser.add_argument(
+        "--scope",
+        choices=("quick", "gate", "both"),
+        default="quick",
+        help="Dory: 'quick' (HE+ + LCB quick, padrão), 'gate' (HE+, MBPP+, LCB full/Pro, SciCode) ou 'both'. Qwen só tem quick.",
+    )
     parser.add_argument("positional_target", nargs="?", default=None)
     args = parser.parse_args()
 
@@ -177,12 +185,12 @@ def main() -> None:
         script_path = str(Path(__file__).resolve())
         for sub_target in ("L1", "L2", "L4", "qwen"):
             print(f"\n{'=' * 20} SUBPROCESSO BASELINE = {sub_target} {'=' * 20}")
-            proc = subprocess.run([sys.executable, script_path, "--target", sub_target], check=False)
+            proc = subprocess.run([sys.executable, script_path, "--target", sub_target, "--scope", args.scope], check=False)
             if proc.returncode != 0:
                 sys.exit(proc.returncode)
         _run_single_target("plot", repo_root)
     else:
-        _run_single_target(target, repo_root)
+        _run_single_target(target, repo_root, scope=args.scope)
 
 
 if __name__ == "__main__":
