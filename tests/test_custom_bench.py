@@ -312,7 +312,11 @@ class TestCustomBench(unittest.TestCase):
                     mock.patch("lib.custom_bench.build_custom_suite", lambda subset: one_per_family):
                 res = eval_custom(None, None, **kw)
                 again = eval_custom(None, None, **kw)  # já registrado: pula sem duplicar
+                teto = eval_custom(None, None, **kw, tier="hard")  # teto: só o hard, bench separado
             n_lines = len((Path(tmp) / "results.jsonl").read_text(encoding="utf-8").splitlines())
+        self.assertEqual(teto["bench"], "custom_quick_hard")
+        self.assertEqual(teto["config"]["n_problems"], 6)
+        self.assertIsNone(teto["config"]["easy_pass1"])
         self.assertEqual(res["bench"], "custom_quick")
         self.assertAlmostEqual(res["pass1"], 1 / 18, places=5)
         cfg = res["config"]
@@ -322,7 +326,7 @@ class TestCustomBench(unittest.TestCase):
         self.assertEqual(cfg["fail_breakdown"], {"truncated": 17})
         self.assertEqual(cfg["family_pass1"]["pair_count"], 1.0)
         self.assertEqual(again["timestamp"], res["timestamp"])
-        self.assertEqual(n_lines, 1)
+        self.assertEqual(n_lines, 2)
 
     def test_metricas_extras(self):
         rows = {

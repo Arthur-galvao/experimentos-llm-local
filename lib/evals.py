@@ -947,12 +947,17 @@ def eval_custom(
     smoke: bool = False,
     smoke_n: int = 5,
     force: bool = False,
+    tier: str | None = None,
 ) -> dict[str, Any]:
-    """Benchmark custom (`lib/custom_bench.py`): `subset='quick'` (126 problemas) ou `'full'` (504)."""
+    """Benchmark custom (`lib/custom_bench.py`): `subset='quick'` (126 problemas) ou `'full'` (504).
+    `tier` ('easy'/'medium'/'hard') roda só esse nível e grava como bench `custom_{subset}_{tier}`."""
     from .custom_bench import CUSTOM_PROTOCOL_ID, build_custom_suite, custom_extra_metrics
 
+    problems = build_custom_suite(subset)
+    if tier is not None:
+        problems = [p for p in problems if str(p["task_id"]).split("/")[0] == tier]
     return _run_problems_loop(
-        problems=build_custom_suite(subset),
+        problems=problems,
         model=model,
         tokenizer=tokenizer,
         run_id=run_id,
@@ -961,7 +966,7 @@ def eval_custom(
         checkpoint=checkpoint,
         n_loops=n_loops,
         eval_tier=subset,
-        bench_name=f"custom_{subset}",
+        bench_name=f"custom_{subset}" + (f"_{tier}" if tier else ""),
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,

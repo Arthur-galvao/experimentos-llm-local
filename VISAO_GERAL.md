@@ -113,7 +113,7 @@ Um LLM traduzindo um log comprimido gera uma explicação plausível, mas não f
 ### Fluxo
 - **A cada experimento:** `custom_quick`.
 - **No fim de cada fase:** `custom_full`, contra o baseline reproduzido nos mesmos problemas.
-- **Critério de corte:** a fase só fica se melhorar a curva acerto × tokens no `custom_full` sem perder acerto em nenhum nível (easy/medium/hard). Ganho no hard só conta como ganho de raciocínio se cair o `wrong_answer` do `hard_fail_breakdown`, e não só o truncamento. Se não passar, a fase é descartada e o projeto segue da melhor versão anterior.
+- **Critério de corte:** a fase só fica se melhorar a curva acerto × tokens no `custom_full` sem perder acerto em nenhum nível (easy/medium/hard). Ganho no hard só conta como ganho de raciocínio se a fase, em 16k tokens, passar o teto do L2 base com 64k (`custom_*_teto`). Ganho até o teto é ganho de tokens. Se não passar, a fase é descartada e o projeto segue da melhor versão anterior.
 - **Demonstração final:** os benchmarks públicos acima, contra os números de [RESULTADOS_F0.md](RESULTADOS_F0.md).
 
 ### Baseline

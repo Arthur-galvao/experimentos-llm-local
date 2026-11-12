@@ -33,7 +33,11 @@ São 18 famílias de problemas de código, 6 por nível:
 | medium | O Dory acerta a maioria, e os loops se separam (na v1: L1 64%, L2 88%). Avisa cedo se uma fase quebra o raciocínio médio. | espiral a partir de um canto, contagem de escadas mod M, maior trecho balanceado de parênteses, grade com passes grátis (Dijkstra com estado), intervalos com peso e folga, jogo de pilhas (Grundy) |
 | hard | O Dory acerta pouco (alvo de 10% a 25%). É aqui que se vê se uma fase ganhou raciocínio ou só economizou tokens. | DP de dígitos com 3 condições até 10^18, strings sem padrões proibidos até 10^18 (autômato + potência de matriz), conjunto de nós de uma árvore com distância mínima (DP em árvore), menor número de trocas para agrupar valores (DP em bitmask sobre inversões), jogo de pilhas com divisão (Sprague-Grundy), subsequências distintas de tamanho k com restrição entre vizinhos |
 
-**Como ler o hard:** se o acerto do hard sobe, olhe o `hard_fail_breakdown`. Se só caiu o `truncated` (o modelo agora termina dentro de 16k tokens) e o `wrong_answer` não mudou, o ganho é de tokens, não de raciocínio. Ganho de raciocínio é o `wrong_answer` cair, ou acertar problemas que antes terminavam errados. No quick, o hard tem 42 problemas, e um a mais muda ~2,4 pontos. Para afirmar ganho no hard, use o `custom_full` (168 problemas no hard).
+**Como ler o hard:** na v2, quase toda falha do Dory no hard é `truncated`: ele não erra a resposta, ele não termina dentro de 16k tokens. Por isso o `wrong_answer` sozinho não separa raciocínio de tokens. A comparação é com o **teto**: o mesmo hard rodado no L2 base com 64k tokens (`--scope custom_quick_teto`, registro `F0_dory_L2_teto64k` no bench `custom_quick_hard`).
+- A fase, em 16k, acerta **mais que o teto**: ganhou raciocínio. Resolve o que o modelo base não resolve nem com 4x mais tokens.
+- Acerta mais que o L2 em 16k, mas **até o teto**: ganhou tokens. Faz o mesmo raciocínio em menos espaço.
+
+No quick, o hard tem 42 problemas, e um a mais muda ~2,4 pontos. Para afirmar ganho no hard, use o `custom_full` e o teto do full (`custom_full_teto`), com 168 problemas no hard.
 
 - **Cada instância muda o problema, não só os nomes.** A semente sorteia parâmetros como o conjunto de passos, o tipo de movimento, o canto e o sentido da espiral, o limite de itens ou o módulo, e a resposta certa muda com eles.
 - **O enunciado traz restrições, dois exemplos e uma assinatura fixa.** A correção usa cerca de 14 testes escondidos por problema, com casos de borda. Nos níveis medium e hard há também entradas grandes, que reprovam força bruta exponencial. O limite é de 10 s por problema, folgado para não reprovar uma solução polinomial correta.
@@ -70,5 +74,7 @@ Ainda não mede: VRAM (F5) e média de loops por token (F2 adaptativo), porque d
 
 - **custom_v1** (commit 574a5c3): o Dory saturou. Easy 100%, hard ~90% no L2, e 12 das 18 famílias deram 100% em todos os loops. Pass@1 / CoT médio: L1 0.881 / 6486, L2 0.960 / 5974, L4 0.944 / 5848, Qwen 0.468 / 12292. A ordem foi a mesma dos benchmarks públicos.
 - **custom_v2** (atual): o easy ficou igual. O medium passou a ser formado pelas 6 famílias da v1 que separavam os loops. As 6 que davam sempre 100% saíram, e entraram 6 hard novas. A semente é a mesma, então o easy e as famílias que mudaram de nível geram as mesmas instâncias da v1.
+  - Rodada quick (commit 2840852), pass@1 easy / medium / hard: L1 1.00 / 0.74 / 0.19, L2 1.00 / 0.81 / 0.29, L4 1.00 / 0.83 / 0.24, Qwen 0.88 / 0.19 / 0.00.
+  - No hard, 29 das 30 falhas do L2 foram truncamento em 16k. `tree_spread` deu 0% em todos os modelos e `distinct_subseq` só passou de 0 no L4 (14%). Elas não foram aliviadas: o teto em 64k mostra se são difíceis de verdade ou só longas.
 
 Depois de cada rodada de baselines, confira o `family_pass1`. No hard, uma família que fique em 0% para todos os loops não mede nada; nesse caso, alivie os parâmetros dela e suba a versão.

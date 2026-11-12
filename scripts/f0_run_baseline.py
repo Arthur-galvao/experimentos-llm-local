@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+TETO_MAX_NEW_TOKENS = 64000  # orçamento do teto do hard (4x os 16k das fases)
+
 
 def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> None:
     from lib.dory import (
@@ -32,6 +34,11 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
     eval_cache_dir = paths["eval_cache"]
     lcb_quick_path = paths["data"] / "lcb_quick.json"
     eval_hw_cfg = get_hw_config("eval")
+
+    teto = scope.endswith("_teto")
+    if teto and target != "L2":
+        print(f"[teto] {target} pulado: o teto do hard só é medido no L2 (base da F1).")
+        return
 
     if target in ("L1", "L2", "L4", "qwen"):
         if target == "qwen":
@@ -66,7 +73,14 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
         if scope in ("gate", "both") and target != "qwen":  # Qwen não tem gate
             print(f"\n>>> [Subprocesso {target}] eval_gate (vLLM, lotes de 128) para {run_id} (n_loops={k_loops})...")
             eval_gate(repo, tok, **common)
-        if scope.startswith("custom_"):
+        if scope.startswith("custom_") and teto:
+            # Teto: o mesmo hard com orçamento 4x maior. Fase que passar disso em 16k ganhou raciocínio;
+            # entre o L2 em 16k e este teto, só fez o mesmo raciocínio com menos tokens.
+            subset = scope.split("_")[1]
+            common.update(run_id=f"{run_id}_teto{TETO_MAX_NEW_TOKENS // 1000}k", max_new_tokens=TETO_MAX_NEW_TOKENS)
+            print(f"\n>>> [Subprocesso {target}] teto do hard ({subset}, {TETO_MAX_NEW_TOKENS} tokens) para {run_id}...")
+            eval_custom(repo, tok, subset=subset, tier="hard", **common)
+        elif scope.startswith("custom_"):
             subset = scope.split("_", 1)[1]
             print(f"\n>>> [Subprocesso {target}] benchmark custom ({subset}) para {run_id} (n_loops={k_loops})...")
             eval_custom(repo, tok, subset=subset, **common)
@@ -150,10 +164,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--scope",
-        choices=("custom_quick", "custom_full", "quick", "gate", "both"),
+        choices=("custom_quick", "custom_full", "custom_quick_teto", "custom_full_teto", "quick", "gate", "both"),
         default="custom_quick",
         help=(
-            "'custom_quick' (126 problemas custom, padrão) ou 'custom_full' (504); benchmarks públicos: "
+            "'custom_quick' (126 problemas custom, padrão) ou 'custom_full' (504); '*_teto' roda só o hard "
+            f"do L2 com {TETO_MAX_NEW_TOKENS} tokens (os outros alvos são pulados); benchmarks públicos: "
             "'quick' (HE+ + LCB quick), 'gate' (HE+, MBPP+, LCB full/Pro, SciCode; Qwen não tem) ou 'both'."
         ),
     )
