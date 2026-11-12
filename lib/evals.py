@@ -12,8 +12,10 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+from .dory import official_sampling
 from .gen import THINK_CLOSE, Output, format_chat_prompt, generate
 from .io import ResumableProgress
+from .metrics import repetition_score
 from .registry import DEFAULT_RESULTS_PATH, append_result, has_completed_run
 from .sandbox import check_solution
 from .scicode_eval import (
@@ -297,6 +299,13 @@ def _run_problems_loop(
     """
     effective_tier = "smoke" if smoke else eval_tier
     allow_hf_fallback = bool(smoke)
+    # Amostragem fora da do Dory (Qwen: top_k/presence) entra no protocolo e no cache: resultado e gerações
+    # antigas da Qwen, feitas sem elas, não são reaproveitados.
+    samp = official_sampling(model_name)
+    if samp["top_k"] or samp["presence_penalty"]:
+        tag = f"_k{samp['top_k']}_pp{samp['presence_penalty']}"
+        cache_suffix += tag
+        protocol_id = protocol_id + tag if protocol_id is not None else None
 
     if not smoke and not force:
         existing = has_completed_run(
@@ -376,6 +385,8 @@ def _run_problems_loop(
                     fn_name=prob.get("fn_name"),
                     **prob.get("sandbox_kwargs", {}),
                 )
+            # Truncada = atingiu `max_new_tokens` sem fechar `</think>` (só mede; não altera nada).
+            truncated = bool(out.n_total_tokens >= max_new_tokens and THINK_CLOSE not in out.text)
             progress.record(
                 str(prob["task_id"]),
                 {
@@ -385,8 +396,10 @@ def _run_problems_loop(
                     "latency_s": out.latency_s,
                     "backend": out.backend,
                     "error_type": sb.error_type,
-                    # Truncada = atingiu `max_new_tokens` sem fechar `</think>` (só mede; não altera nada).
-                    "truncated": bool(out.n_total_tokens >= max_new_tokens and THINK_CLOSE not in out.text),
+                    "truncated": truncated,
+                    "loop_score": repetition_score(out.cot_text),  # ~1 = travou repetindo
+                    # final da CoT das truncadas, para ler se era loop ou raciocínio ainda andando
+                    **({"tail": out.cot_text[-1500:]} if truncated else {}),
                     **extra_fields,
                 },
             )
@@ -414,6 +427,9 @@ def _run_problems_loop(
         "max_new_tokens": max_new_tokens,
         "temperature": temperature,
         "top_p": top_p,
+        # aplicados pelo vLLM a partir da amostragem oficial do modelo (lib/dory.py)
+        "top_k": samp["top_k"],
+        "presence_penalty": samp["presence_penalty"],
         "seed": seed,
         "batch_size": batch_size,
         "n_problems": len(active_problems),
@@ -936,7 +952,7 @@ def eval_custom(
     model_name: str = "dory-4b",
     checkpoint: str = "base",
     n_loops: int | None = 2,
-    max_new_tokens: int = 16000,
+    max_new_tokens: int | None = None,
     temperature: float = 1.0,
     top_p: float = 0.95,
     seed: int = 42,
@@ -947,17 +963,14 @@ def eval_custom(
     smoke: bool = False,
     smoke_n: int = 5,
     force: bool = False,
-    tier: str | None = None,
 ) -> dict[str, Any]:
     """Benchmark custom (`lib/custom_bench.py`): `subset='quick'` (126 problemas) ou `'full'` (504).
-    `tier` ('easy'/'medium'/'hard') roda só esse nível e grava como bench `custom_{subset}_{tier}`."""
-    from .custom_bench import CUSTOM_PROTOCOL_ID, build_custom_suite, custom_extra_metrics
+    `max_new_tokens=None` usa o orçamento do protocolo (`CUSTOM_MAX_NEW_TOKENS`)."""
+    from .custom_bench import CUSTOM_MAX_NEW_TOKENS, CUSTOM_PROTOCOL_ID, build_custom_suite, custom_extra_metrics
 
-    problems = build_custom_suite(subset)
-    if tier is not None:
-        problems = [p for p in problems if str(p["task_id"]).split("/")[0] == tier]
+    budget = CUSTOM_MAX_NEW_TOKENS if max_new_tokens is None else int(max_new_tokens)
     return _run_problems_loop(
-        problems=problems,
+        problems=build_custom_suite(subset),
         model=model,
         tokenizer=tokenizer,
         run_id=run_id,
@@ -966,8 +979,8 @@ def eval_custom(
         checkpoint=checkpoint,
         n_loops=n_loops,
         eval_tier=subset,
-        bench_name=f"custom_{subset}" + (f"_{tier}" if tier else ""),
-        max_new_tokens=max_new_tokens,
+        bench_name=f"custom_{subset}",
+        max_new_tokens=budget,
         temperature=temperature,
         top_p=top_p,
         seed=seed,
@@ -980,7 +993,7 @@ def eval_custom(
         force=force,
         protocol_id=CUSTOM_PROTOCOL_ID,
         cache_suffix=f"_{CUSTOM_PROTOCOL_ID}",  # cache por problema não mistura versões do benchmark
-        extra_config_fn=custom_extra_metrics,
+        extra_config_fn=lambda rows: custom_extra_metrics(rows, max_new_tokens=budget),
     )
 
 

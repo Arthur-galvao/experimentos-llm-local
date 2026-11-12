@@ -14,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
-from .dory import DORY_HF_REPO, QWEN_CONTROL_HF_REPO, set_dory_loops
+from .dory import DORY_HF_REPO, QWEN_CONTROL_HF_REPO, official_sampling, set_dory_loops
 
 THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
@@ -450,6 +450,8 @@ def _generate_hf(
                 "eos_token_id": tokenizer.eos_token_id,
             }
             if do_sample:
+                # shortcut: o caminho HF (só smoke/fallback) não aplica top_k/presence_penalty oficiais;
+                # medição de verdade é sempre no vLLM, que aplica.
                 gen_kwargs["temperature"] = float(temperature)
                 gen_kwargs["top_p"] = float(top_p)
             if n_loops is not None:
@@ -611,6 +613,8 @@ def _vllm_subprocess_worker_main(in_json_path: str, out_json_path: str) -> None:
     max_new_tokens = int(req.get("max_new_tokens", 4096))
     temperature = float(req.get("temperature", 0.0))
     top_p = float(req.get("top_p", 1.0))
+    top_k = int(req.get("top_k", -1))
+    presence_penalty = float(req.get("presence_penalty", 0.0))
     n_samples = int(req.get("n_samples", 1))
     seed = int(req.get("seed", 42))
     n_loops = req.get("n_loops")
@@ -757,6 +761,8 @@ def _vllm_subprocess_worker_main(in_json_path: str, out_json_path: str) -> None:
         n=n_samples,
         temperature=temperature,
         top_p=top_p if temperature > 1e-5 else 1.0,
+        top_k=top_k,
+        presence_penalty=presence_penalty,
         max_tokens=max_new_tokens,
         seed=seed,
     )
@@ -865,7 +871,8 @@ def _get_or_create_vllm_engine(
     import gc
     from vllm import LLM  # type: ignore[import-not-found]
 
-    engine_key = (model_name, n_loops, recurrent_kv_cache_mode)
+    # max_model_len na chave: motor de 16k reaproveitado num custom de 81.920 cortaria calado as respostas
+    engine_key = (model_name, n_loops, recurrent_kv_cache_mode, max_model_len)
     if _CACHED_VLLM_ENGINE is not None:
         cached_key, cached_llm = _CACHED_VLLM_ENGINE
         if cached_key == engine_key:
@@ -959,10 +966,16 @@ def _generate_vllm(
             except Exception:
                 tok_for_cot = None
 
+        # top_k / presence_penalty vêm da amostragem oficial do modelo (Qwen: 20 / 1.5; Dory: desligados).
+        # Motor já instanciado não diz o repo: usa a do Dory.
+        extra = official_sampling(None if _is_vllm_engine_instance(vllm_engine_or_model_name) else model_name)
+        sampled = temperature > 1e-5
         sampling_params = SamplingParams(
             n=int(n_samples),
             temperature=float(temperature),
-            top_p=float(top_p) if temperature > 1e-5 else 1.0,
+            top_p=float(top_p) if sampled else 1.0,
+            top_k=int(extra["top_k"]) if sampled and int(extra["top_k"]) > 0 else -1,
+            presence_penalty=float(extra["presence_penalty"]) if sampled else 0.0,
             max_tokens=int(max_new_tokens),
             seed=int(seed),
         )
@@ -1030,13 +1043,17 @@ def _generate_vllm(
             recurrent_kv_cache_mode=recurrent_kv_cache_mode,
         )
 
+    extra = official_sampling(model_name)  # mesma regra do caminho em processo
+    sampled = temperature > 1e-5
     request_payload = {
         "mode": "generate",
         "model_name": model_name,
         "prompts": prompts,
         "max_new_tokens": int(max_new_tokens),
         "temperature": float(temperature),
-        "top_p": float(top_p) if temperature > 1e-5 else 1.0,
+        "top_p": float(top_p) if sampled else 1.0,
+        "top_k": int(extra["top_k"]) if sampled and int(extra["top_k"]) > 0 else -1,
+        "presence_penalty": float(extra["presence_penalty"]) if sampled else 0.0,
         "n_samples": int(n_samples),
         "seed": int(seed),
         "n_loops": int(n_loops) if (n_loops is not None and not is_qwen) else None,

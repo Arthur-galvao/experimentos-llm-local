@@ -4,6 +4,8 @@ Concluído em 2026-11-12. Os números de referência das fases seguintes são os
 
 **Configuração fixa** (igual em todas as linhas): vLLM (PR #60149), `max_new_tokens=16000`, `temperature=1.0`, `top_p=0.95`, `seed=42`. **Truncado** = atingiu 16k tokens sem fechar `</think>`; truncado conta como **erro** (ver "Correções").
 
+> **Aviso sobre a Qwen (descoberto depois):** as linhas da Qwen3.5-4B rodaram com a amostragem do Dory, sem o `top_k=20` e o `presence_penalty=1.5` que a página da Qwen recomenda, e com 16k tokens, quando ela recomenda de 32k a 81k. Os números dela abaixo subestimam o modelo e não valem como controle. Os do Dory estão na configuração oficial. A amostragem oficial agora sai de `OFFICIAL_SAMPLING`. Ela entra no protocolo e no cache da Qwen (sufixo `_k20_pp1.5`), então a próxima rodada pública da Qwen refaz tudo sozinha, sem reaproveitar as gerações antigas. Ainda falta decidir o orçamento público da Qwen para a demonstração final: 16k como o do Dory, ou os 32k a 81k que ela recomenda.
+
 ## 1. Equivalência vLLM × reimplementação HF (`lib/dory.py`)
 
 5 prompts × 32 tokens gulosos por loop; limite de 2% de divergência no top-1.

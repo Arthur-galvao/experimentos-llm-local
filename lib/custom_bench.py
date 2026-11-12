@@ -5,7 +5,7 @@ a semântica do problema (não só nomes), e os testes vêm da solução de refe
 família de medium/hard tem uma força bruta independente em `tests/test_custom_bench.py` que confere a
 referência. Determinístico: mesma semente => mesmos problemas; `quick` é um prefixo de `full`.
 
-Níveis (custom_v2): easy = Dory acerta tudo (mede pensar demais no simples); medium = Dory acerta
+Níveis (desde a custom_v2): easy = Dory acerta tudo (mede pensar demais no simples); medium = Dory acerta
 a maioria e separa os loops; hard = técnicas não óbvias onde o Dory acerta pouco, para separar ganho de
 raciocínio de ganho só de tokens.
 
@@ -25,8 +25,18 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable
 
-CUSTOM_PROTOCOL_ID = "custom_v2"  # mude ao alterar qualquer família: invalida resultados antigos
+from .metrics import LOOP_SCORE_THRESHOLD
+
+# Mude ao alterar qualquer família ou o protocolo de geração: invalida resultados antigos.
+# v3 = mesmas instâncias da v2, com orçamento de CUSTOM_MAX_NEW_TOKENS e amostragem oficial de cada modelo.
+CUSTOM_PROTOCOL_ID = "custom_v3"
 CUSTOM_SEED = "coder-comprimido-custom-v1"
+# Orçamento grande para o truncamento não decidir o acerto: 81.920 é o que a Qwen recomenda para
+# programação de competição (o Dory aceita até 256K). Os cortes menores saem da mesma rodada (BUDGETS).
+CUSTOM_MAX_NEW_TOKENS = 81920
+# pass@1 "se o limite fosse B": a resposta passou e coube em B tokens gerados. O mesmo começo de resposta
+# sairia com limite B (o limite não muda a amostragem), a menos de ruído numérico do lote.
+BUDGETS = (4000, 8000, 16000, 32000)
 INSTANCES_PER_FAMILY = {"quick": 7, "full": 28}  # 18 famílias => 126 / 504 problemas
 SANDBOX_KWARGS = {"timeout_s": 10.0, "max_memory_mb": 1024}
 TIERS = ("easy", "medium", "hard")
@@ -871,27 +881,47 @@ def build_custom_suite(subset: str = "quick") -> list[dict[str, Any]]:
 
 def _fail_bucket(row: dict[str, Any]) -> str:
     if row.get("truncated"):
-        return "truncated"
+        # "loop" = estourou o orçamento repetindo o mesmo bloco; "truncated" = ainda estava raciocinando
+        return "loop" if float(row.get("loop_score", 0.0)) >= LOOP_SCORE_THRESHOLD else "truncated"
     return {"EmptyCode": "no_code", "AssertionError": "wrong_answer", "TimeoutError": "timeout"}.get(
         str(row.get("error_type")), "runtime_error"
     )
 
 
-def custom_extra_metrics(rows_by_id: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
-    """Métricas por nível/família/falha para o `config` do registro em `results.jsonl`."""
+def _median(xs: list[float]) -> float | None:
+    xs = sorted(xs)
+    if not xs:
+        return None
+    mid = len(xs) // 2
+    return round(xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2, 1)
+
+
+def custom_extra_metrics(
+    rows_by_id: dict[str, dict[str, Any] | None], max_new_tokens: int | None = None
+) -> dict[str, Any]:
+    """Métricas por nível/família/falha para o `config` do registro em `results.jsonl`.
+    `max_new_tokens` (orçamento da rodada) limita os cortes de `BUDGETS` aos menores que ele."""
     rows = {tid: r for tid, r in rows_by_id.items() if r is not None}
     out: dict[str, Any] = {"custom_protocol": CUSTOM_PROTOCOL_ID}
+    budgets = [b for b in BUDGETS if max_new_tokens is None or b < max_new_tokens]
 
     def mean(xs):
         xs = list(xs)
         return round(sum(xs) / len(xs), 4) if xs else None
 
+    def pass_at(rs, b):  # passou e coube em b tokens gerados (CoT + resposta)
+        return mean(float(bool(r.get("passed")) and float(r.get("n_total_tokens", 0)) <= b) for r in rs)
+
+    out["pass1_at_budget"] = {str(b): pass_at(rows.values(), b) for b in budgets}
     for tier in TIERS:
         rs = [r for tid, r in rows.items() if tid.split("/")[0] == tier]
         out[f"{tier}_pass1"] = mean(float(bool(r.get("passed"))) for r in rs)
+        out[f"{tier}_pass1_at_budget"] = {str(b): pass_at(rs, b) for b in budgets}
         out[f"{tier}_tokens_cot_mean"] = mean(float(r.get("n_cot_tokens", 0)) for r in rs)
+        # mediana: poucas respostas em loop até o orçamento puxam a média para cima
+        out[f"{tier}_tokens_cot_median"] = _median([float(r.get("n_cot_tokens", 0)) for r in rs])
         out[f"{tier}_truncated_frac"] = mean(float(bool(r.get("truncated"))) for r in rs)
-        # no hard separa "errou o raciocínio" (wrong_answer/timeout) de "só não coube no orçamento" (truncated)
+        # separa errou o raciocínio (wrong_answer/timeout), não coube (truncated) e travou repetindo (loop)
         out[f"{tier}_fail_breakdown"] = dict(Counter(_fail_bucket(r) for r in rs if not r.get("passed")))
     ok = [r for r in rows.values() if r.get("passed")]
     out["tokens_cot_mean_correct"] = mean(float(r.get("n_cot_tokens", 0)) for r in ok)

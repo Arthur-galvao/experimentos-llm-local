@@ -14,6 +14,22 @@ def acerto_por_1k_tokens(pass1: float, tokens_cot_mean: float, tokens_total_mean
     return float(pass1) / (float(denom) / 1000.0)
 
 
+LOOP_SCORE_THRESHOLD = 0.5  # shortcut: limiar chutado; calibrar lendo os `tail` das truncadas da 1ª rodada v3
+
+
+def repetition_score(text: str, window_words: int = 2000, n: int = 8) -> float:
+    """Fração de 8-gramas de palavras repetidos nas últimas `window_words` palavras (0 = nada repete, ~1 = loop).
+
+    Raciocínio normal repete pouco (refaz uma conta, relê um trecho); um loop repete o mesmo bloco sem parar.
+    Abaixo de 200 palavras devolve 0.0 (pouco texto para julgar).
+    """
+    words = str(text).split()[-window_words:]
+    if len(words) < 200:
+        return 0.0
+    grams = [tuple(words[i : i + n]) for i in range(len(words) - n + 1)]
+    return round(1.0 - len(set(grams)) / len(grams), 4)
+
+
 def is_pareto_dominated(candidate: dict[str, Any], others: list[dict[str, Any]]) -> bool:
     """A point `candidate` is Pareto-dominated if another point in `others` has:
       - pass1 >= candidate['pass1'] AND tokens_cot_mean <= candidate['tokens_cot_mean']

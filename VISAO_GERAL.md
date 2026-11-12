@@ -113,13 +113,20 @@ Um LLM traduzindo um log comprimido gera uma explicação plausível, mas não f
 ### Fluxo
 - **A cada experimento:** `custom_quick`.
 - **No fim de cada fase:** `custom_full`, contra o baseline reproduzido nos mesmos problemas.
-- **Critério de corte:** a fase só fica se melhorar a curva acerto × tokens no `custom_full` sem perder acerto em nenhum nível (easy/medium/hard). Ganho no hard só conta como ganho de raciocínio se a fase, em 16k tokens, passar o teto do L2 base com 64k (`custom_*_teto`). Ganho até o teto é ganho de tokens. Se não passar, a fase é descartada e o projeto segue da melhor versão anterior.
+- **Critério de corte:** a fase só fica se melhorar a curva acerto × tokens no `custom_full` sem perder acerto em nenhum nível (easy/medium/hard). O custom roda com orçamento de 81.920 tokens. Ganho de raciocínio é o `hard_pass1` subir. Ganho de tokens é o mesmo acerto com menos tokens, ou mais acerto com limite menor (`hard_pass1_at_budget`). Se não passar, a fase é descartada e o projeto segue da melhor versão anterior.
 - **Demonstração final:** os benchmarks públicos acima, contra os números de [RESULTADOS_F0.md](RESULTADOS_F0.md).
 
 ### Baseline
 Os números dos model cards são vendor-reported. Reproduzimos o Dory (1, 2 e 4 loops) e o Qwen3.5-4B na nossa configuração, e **esses** passam a ser os números de referência.
 
-**Configuração fixa de geração** (vale para todas as comparações): `max_new_tokens=16000`, `temperature=1.0`, `top_p=0.95` (o recomendado pela NVIDIA), `seed=42`, backend vLLM. Mudar algum desses invalida a comparação.
+**Configuração fixa de geração** (vale para todas as comparações):
+- **Amostragem oficial de cada modelo** (`OFFICIAL_SAMPLING` em `lib/dory.py`):
+  - Dory, como recomenda a NVIDIA: `temperature=1.0`, `top_p=0.95`.
+  - Qwen3.5-4B, modo de pensamento para tarefas gerais: `temperature=1.0`, `top_p=0.95`, `top_k=20`, `presence_penalty=1.5`.
+- `seed=42`, backend vLLM.
+- Orçamento: 81.920 tokens no benchmark custom e 16.000 nos públicos.
+
+Mudar algum desses invalida a comparação.
 
 **Validação da reimplementação:** o Transformers não tem implementação do Dory. Usamos a nossa (`lib/dory.py`), conferida linha a linha contra o código oficial da PR do vLLM e validada por um teste numérico de equivalência (`F0b_equivalence.ipynb`).
 

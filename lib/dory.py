@@ -56,6 +56,24 @@ except ImportError:  # pragma: no cover
 DORY_HF_REPO = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
 QWEN_CONTROL_HF_REPO = "Qwen/Qwen3.5-4B"
 
+# Amostragem oficial de cada modelo, copiada da página dele no HF (conferida em 2026-11-12).
+# Dory: "Temperature 1.0 and Top_P 0.95"; generation_config.json com top_k=0 (desligado).
+# Qwen3.5-4B: "Thinking mode for general tasks" (top_k 20 e presence_penalty 1.5 contra repetição infinita).
+# Modelo fora da tabela (checkpoints das fases, derivados do Dory) usa a do Dory.
+OFFICIAL_SAMPLING: dict[str, dict[str, float | int]] = {
+    DORY_HF_REPO: {"temperature": 1.0, "top_p": 0.95, "top_k": 0, "presence_penalty": 0.0},
+    QWEN_CONTROL_HF_REPO: {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
+}
+
+
+def official_sampling(model_name: Any) -> dict[str, float | int]:
+    """Amostragem oficial para `model_name` (repo do HF); a do Dory se o modelo não estiver na tabela."""
+    name = str(model_name)
+    if name not in OFFICIAL_SAMPLING and "qwen" in name.lower():
+        # Qwen por caminho local ou outro repo cairia calada na amostragem do Dory
+        raise ValueError(f"Qwen sem amostragem oficial em OFFICIAL_SAMPLING: {name!r}")
+    return dict(OFFICIAL_SAMPLING.get(name, OFFICIAL_SAMPLING[DORY_HF_REPO]))
+
 
 def justnorm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     """Hyperspherical L2 normalization in float32, cast back to `x.dtype` (nGPT / Dory)."""

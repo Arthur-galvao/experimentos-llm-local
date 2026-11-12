@@ -10,8 +10,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-TETO_MAX_NEW_TOKENS = 64000  # orçamento do teto do hard (4x os 16k das fases)
-
 
 def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> None:
     from lib.dory import (
@@ -19,13 +17,14 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
         QWEN_CONTROL_HF_REPO,
         enforce_tokenizer_report,
         load_dory_tokenizer,
+        official_sampling,
         verify_tokenizer_equivalence,
     )
     from lib.evals import eval_custom, eval_gate, eval_quick
     from lib.hw import get_hw_config
     from lib.io import DEFAULT_DRIVE_ROOT, ensure_model_files, setup_drive_and_cache
     from lib.metrics import plot_pareto
-    from lib.custom_bench import CUSTOM_PROTOCOL_ID
+    from lib.custom_bench import CUSTOM_MAX_NEW_TOKENS, CUSTOM_PROTOCOL_ID
     from lib.registry import load_results
 
     paths = setup_drive_and_cache(drive_root=DEFAULT_DRIVE_ROOT, local_fallback_root=repo_root)
@@ -34,11 +33,6 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
     eval_cache_dir = paths["eval_cache"]
     lcb_quick_path = paths["data"] / "lcb_quick.json"
     eval_hw_cfg = get_hw_config("eval")
-
-    teto = scope.endswith("_teto")
-    if teto and target != "L2":
-        print(f"[teto] {target} pulado: o teto do hard só é medido no L2 (base da F1).")
-        return
 
     if target in ("L1", "L2", "L4", "qwen"):
         if target == "qwen":
@@ -50,15 +44,16 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
             ensure_model_files(repo)
             enforce_tokenizer_report(verify_tokenizer_equivalence(repo))
         tok = load_dory_tokenizer(repo)
+        sampling = official_sampling(repo)  # temperatura/top_p oficiais; top_k/presence o vLLM aplica sozinho
         common = dict(
             run_id=run_id,
             phase="F0",
             model_name=repo,
             checkpoint="base",
             n_loops=k_loops,
-            max_new_tokens=16000,
-            temperature=1.0,
-            top_p=0.95,
+            max_new_tokens=16000,  # benchmarks públicos; o custom usa o orçamento dele (CUSTOM_MAX_NEW_TOKENS)
+            temperature=float(sampling["temperature"]),
+            top_p=float(sampling["top_p"]),
             seed=42,
             backend="vllm",
             batch_size=eval_hw_cfg["batch_size"],
@@ -73,17 +68,13 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
         if scope in ("gate", "both") and target != "qwen":  # Qwen não tem gate
             print(f"\n>>> [Subprocesso {target}] eval_gate (vLLM, lotes de 128) para {run_id} (n_loops={k_loops})...")
             eval_gate(repo, tok, **common)
-        if scope.startswith("custom_") and teto:
-            # Teto: o mesmo hard com orçamento 4x maior. Fase que passar disso em 16k ganhou raciocínio;
-            # entre o L2 em 16k e este teto, só fez o mesmo raciocínio com menos tokens.
-            subset = scope.split("_")[1]
-            common.update(run_id=f"{run_id}_teto{TETO_MAX_NEW_TOKENS // 1000}k", max_new_tokens=TETO_MAX_NEW_TOKENS)
-            print(f"\n>>> [Subprocesso {target}] teto do hard ({subset}, {TETO_MAX_NEW_TOKENS} tokens) para {run_id}...")
-            eval_custom(repo, tok, subset=subset, tier="hard", **common)
-        elif scope.startswith("custom_"):
+        if scope.startswith("custom_"):
             subset = scope.split("_", 1)[1]
-            print(f"\n>>> [Subprocesso {target}] benchmark custom ({subset}) para {run_id} (n_loops={k_loops})...")
-            eval_custom(repo, tok, subset=subset, **common)
+            print(
+                f"\n>>> [Subprocesso {target}] benchmark custom ({subset}, até {CUSTOM_MAX_NEW_TOKENS} tokens, "
+                f"amostragem {sampling}) para {run_id} (n_loops={k_loops})..."
+            )
+            eval_custom(repo, tok, subset=subset, **{**common, "max_new_tokens": CUSTOM_MAX_NEW_TOKENS})
         print(f"\n=== {run_id}: CONCLUÍDO ===")
         return
 
@@ -91,7 +82,8 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
         f0_records = [  # custom de versão antiga do benchmark não entra na tabela nem no gráfico
             r for r in load_results(results_jsonl, phase="F0")
             if not str(r.get("bench", "")).startswith("custom_")
-            or (r.get("config") or {}).get("eval_protocol") == CUSTOM_PROTOCOL_ID
+            # custom_protocol, não eval_protocol: o da Qwen ganha sufixo da amostragem (ex.: custom_v3_k20_pp1.5)
+            or (r.get("config") or {}).get("custom_protocol") == CUSTOM_PROTOCOL_ID
         ]
         print(f"Total de registros F0 em {results_jsonl}: {len(f0_records)}\n")
         header = (
@@ -112,12 +104,15 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
             cfg = r.get("config") or {}
             if str(r.get("bench", "")).startswith("custom_"):
                 tiers = " | ".join(
-                    f"{t}: pass@1 {cfg.get(f'{t}_pass1')} cot {cfg.get(f'{t}_tokens_cot_mean')} "
-                    f"trunc {cfg.get(f'{t}_truncated_frac')}"
+                    f"{t}: pass@1 {cfg.get(f'{t}_pass1')} cot média {cfg.get(f'{t}_tokens_cot_mean')} "
+                    f"mediana {cfg.get(f'{t}_tokens_cot_median')} trunc {cfg.get(f'{t}_truncated_frac')}"
                     for t in ("easy", "medium", "hard")
                 )
                 print(
-                    f"\n{r['run_id']} {r['bench']}: {tiers}\n  falhas no hard {cfg.get('hard_fail_breakdown')}"
+                    f"\n{r['run_id']} {r['bench']} (até {cfg.get('max_new_tokens')} tokens): {tiers}"
+                    f"\n  pass@1 se o limite fosse B: geral {cfg.get('pass1_at_budget')}"
+                    f" | hard {cfg.get('hard_pass1_at_budget')}"
+                    f"\n  falhas no hard {cfg.get('hard_fail_breakdown')}"
                     f" | cot nos acertos {cfg.get('tokens_cot_mean_correct')}"
                     f" | {cfg.get('throughput_tok_s')} tok/s | falhas {cfg.get('fail_breakdown')}"
                     f"\n  por família {cfg.get('family_pass1')}"
@@ -164,11 +159,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--scope",
-        choices=("custom_quick", "custom_full", "custom_quick_teto", "custom_full_teto", "quick", "gate", "both"),
+        choices=("custom_quick", "custom_full", "quick", "gate", "both"),
         default="custom_quick",
         help=(
-            "'custom_quick' (126 problemas custom, padrão) ou 'custom_full' (504); '*_teto' roda só o hard "
-            f"do L2 com {TETO_MAX_NEW_TOKENS} tokens (os outros alvos são pulados); benchmarks públicos: "
+            "'custom_quick' (126 problemas custom, padrão) ou 'custom_full' (504); benchmarks públicos: "
             "'quick' (HE+ + LCB quick), 'gate' (HE+, MBPP+, LCB full/Pro, SciCode; Qwen não tem) ou 'both'."
         ),
     )

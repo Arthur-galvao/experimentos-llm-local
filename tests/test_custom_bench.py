@@ -312,11 +312,7 @@ class TestCustomBench(unittest.TestCase):
                     mock.patch("lib.custom_bench.build_custom_suite", lambda subset: one_per_family):
                 res = eval_custom(None, None, **kw)
                 again = eval_custom(None, None, **kw)  # já registrado: pula sem duplicar
-                teto = eval_custom(None, None, **kw, tier="hard")  # teto: só o hard, bench separado
             n_lines = len((Path(tmp) / "results.jsonl").read_text(encoding="utf-8").splitlines())
-        self.assertEqual(teto["bench"], "custom_quick_hard")
-        self.assertEqual(teto["config"]["n_problems"], 6)
-        self.assertIsNone(teto["config"]["easy_pass1"])
         self.assertEqual(res["bench"], "custom_quick")
         self.assertAlmostEqual(res["pass1"], 1 / 18, places=5)
         cfg = res["config"]
@@ -326,7 +322,7 @@ class TestCustomBench(unittest.TestCase):
         self.assertEqual(cfg["fail_breakdown"], {"truncated": 17})
         self.assertEqual(cfg["family_pass1"]["pair_count"], 1.0)
         self.assertEqual(again["timestamp"], res["timestamp"])
-        self.assertEqual(n_lines, 2)
+        self.assertEqual(n_lines, 1)
 
     def test_metricas_extras(self):
         rows = {
@@ -345,6 +341,19 @@ class TestCustomBench(unittest.TestCase):
         self.assertEqual(m["fail_breakdown"], {"truncated": 1, "wrong_answer": 1})
         self.assertEqual(m["hard_fail_breakdown"], {"truncated": 1, "wrong_answer": 1})
         self.assertEqual(m["easy_fail_breakdown"], {})
+        # corte por orçamento: passou e coube (150 <= 4000; exatamente no limite também conta)
+        self.assertEqual(m["easy_pass1_at_budget"], {"4000": 1.0, "8000": 1.0, "16000": 1.0, "32000": 1.0})
+        self.assertEqual(custom_extra_metrics(rows, max_new_tokens=16000)["pass1_at_budget"], {"4000": round(1 / 3, 4), "8000": round(1 / 3, 4)})
+        edge = {"easy/a/0": {"passed": True, "n_cot_tokens": 10, "n_total_tokens": 4000}}
+        self.assertEqual(custom_extra_metrics(edge)["pass1_at_budget"]["4000"], 1.0)
+        self.assertEqual(m["hard_tokens_cot_median"], 8450.0)
+        # truncada repetindo vira "loop"; truncada ainda raciocinando continua "truncated"
+        from lib.metrics import repetition_score
+        looping = " ".join(["vou conferir de novo o caso base da recursão agora"] * 60)
+        self.assertGreater(repetition_score(looping), 0.9)
+        self.assertEqual(repetition_score("curto demais"), 0.0)
+        rows["hard/pile_game/0"]["loop_score"] = repetition_score(looping)
+        self.assertEqual(custom_extra_metrics(rows)["hard_fail_breakdown"], {"loop": 1, "wrong_answer": 1})
 
 
 if __name__ == "__main__":
