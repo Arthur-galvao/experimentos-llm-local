@@ -14,7 +14,8 @@ Espelha o fluxo recomendado do repositório oficial (`eval/inspect_ai/scicode.py
 * Script de teste = `required_dependencies` + código dos passos anteriores + resposta do passo atual +
   `targets = process_hdf5_to_tuple(step_id, n_testes, h5)` + `target = targets[i]` + cada `test_case`.
   Roda com `python script.py` e timeout de 1800 s (oficial). Exit code 0 => passou.
-* `test_data.h5` (alvos numéricos) vem do Google Drive oficial; ver `ensure_scicode_test_data`.
+* `test_data.h5` (alvos numéricos) vem do Google Drive oficial ou, se a cota estourar, de um espelho no HF
+  conferido com o modo gold; ver `ensure_scicode_test_data`.
 
 Os `test_cases` oficiais importam `scicode.parse.parse` e `scicode.compare.cmp`; usamos cópias
 vendorizadas em `lib/scicode_shim/` (PYTHONPATH do subprocesso), sem precisar instalar o pacote `scicode`.
@@ -45,6 +46,9 @@ SCICODE_H5_FILENAME = "test_data.h5"
 # Pasta oficial no Google Drive (README do SciCode, passo 3: "numeric test results").
 SCICODE_DRIVE_FOLDER_ID = "1W5GZW6_bdiDAiipuFMqdUhvUaHIj6-pR"
 SCICODE_DRIVE_FOLDER_URL = f"https://drive.google.com/drive/folders/{SCICODE_DRIVE_FOLDER_ID}"
+# Espelho público do mesmo arquivo (fallback quando o Drive oficial bate na cota); aceito só após o gold check.
+SCICODE_HF_MIRROR_REPO = "Srimadh/Scicode-test-data-h5"
+SCICODE_MIRROR_MIN_GOLD_RATE = 0.9
 # Tamanho mínimo plausível (bytes) para o h5 baixado; um HTML de erro do Drive é muito menor.
 # TODO: confirmar o tamanho/checksum oficial de test_data.h5 (não é publicado no repositório; só dá para ver no Colab).
 SCICODE_H5_MIN_BYTES = 1_000_000
@@ -139,41 +143,56 @@ def _validate_scicode_h5(path: Path) -> None:
 
 
 def ensure_scicode_test_data(data_dir: str | Path) -> Path:
-    """Garante `data_dir/test_data.h5` (alvos numéricos do SciCode) e devolve o caminho.
+    """Garante `data_dir/test_data.h5` (alvos numéricos do SciCode) e devolve o caminho, sem passo manual.
 
-    O arquivo NÃO está no HuggingFace nem no GitHub: o README oficial manda baixar da pasta do Google Drive
-    https://drive.google.com/drive/folders/1W5GZW6_bdiDAiipuFMqdUhvUaHIj6-pR e salvar como `test_data.h5`.
-    Aqui o download é feito com `gdown` (pré-instalado no Colab), com verificação de existência, tamanho
-    mínimo e abertura via h5py. Se falhar, levanta RuntimeError com instruções de download manual.
+    1. Google Drive oficial (README do SciCode, passo 3) via `gdown`.
+    2. Se o Drive falhar (cota de downloads é comum), espelho no HF (`SCICODE_HF_MIRROR_REPO`). Como é de
+       terceiros, só é aceito depois do modo `gold` oficial passar no split `validation` com ele.
+    Verifica existência, tamanho mínimo e abertura via h5py. Se tudo falhar, levanta RuntimeError.
     """
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     target = data_dir / SCICODE_H5_FILENAME
 
-    def _ok(p: Path) -> bool:
-        if not p.is_file() or p.stat().st_size < SCICODE_H5_MIN_BYTES:
-            return False
-        try:
-            _validate_scicode_h5(p)
-            return True
-        except Exception:  # noqa: BLE001
-            return False
-
-    if _ok(target):
+    if _h5_ok(target):
         return target
 
-    manual = (
-        f"Baixe manualmente a pasta {SCICODE_DRIVE_FOLDER_URL} e salve o arquivo como {target} "
-        "(README oficial do SciCode, passo 3)."
-    )
+    errors: list[str] = []
+    try:
+        _download_official_drive(data_dir, target)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"Drive oficial: {type(exc).__name__}: {exc}")
+        print(f"[scicode] Drive oficial falhou ({type(exc).__name__}); tentando o espelho {SCICODE_HF_MIRROR_REPO} no HF.")
+        try:
+            _download_hf_mirror_verified(target)
+        except Exception as exc2:  # noqa: BLE001
+            errors.append(f"espelho HF: {type(exc2).__name__}: {exc2}")
+
+    if not _h5_ok(target):
+        raise RuntimeError(
+            f"Não foi possível obter {SCICODE_H5_FILENAME} válido em {target}. "
+            + " | ".join(errors)
+            + f" | Alternativa: baixe a pasta {SCICODE_DRIVE_FOLDER_URL} e salve o arquivo como {target}."
+        )
+    return target
+
+
+def _h5_ok(p: Path) -> bool:
+    if not p.is_file() or p.stat().st_size < SCICODE_H5_MIN_BYTES:
+        return False
+    try:
+        _validate_scicode_h5(p)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _download_official_drive(data_dir: Path, target: Path) -> None:
     try:
         import gdown  # type: ignore[import-not-found]
     except ImportError:
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "gdown"], check=True)
-            import gdown  # type: ignore[import-not-found]
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"`gdown` indisponível ({exc}). {manual}") from exc
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "gdown"], check=True)
+        import gdown  # type: ignore[import-not-found]
 
     tmp_dl = data_dir / "_scicode_download"
     if tmp_dl.exists():
@@ -186,20 +205,29 @@ def ensure_scicode_test_data(data_dir: str | Path) -> Path:
         if not found:
             raise FileNotFoundError(f"{SCICODE_H5_FILENAME} não apareceu na pasta baixada do Drive")
         os.replace(found[0], target)
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            f"Falha ao baixar {SCICODE_H5_FILENAME} do Google Drive ({type(exc).__name__}: {exc}). "
-            f"O Drive pode ter limitado a cota de downloads. {manual}"
-        ) from exc
     finally:
         shutil.rmtree(tmp_dl, ignore_errors=True)
+    if not _h5_ok(target):
+        raise ValueError(f"arquivo baixado inválido ({target.stat().st_size if target.exists() else 0} bytes)")
 
-    if not _ok(target):
-        size = target.stat().st_size if target.exists() else 0
-        raise RuntimeError(
-            f"{target} baixado, mas inválido (tamanho {size} bytes < {SCICODE_H5_MIN_BYTES} ou h5 ilegível). {manual}"
-        )
-    return target
+
+def _download_hf_mirror_verified(target: Path) -> None:
+    from huggingface_hub import hf_hub_download  # type: ignore[import-not-found]
+
+    # Baixa para o cache local do HF (disco do Colab), confere e só então copia para o Drive.
+    local = Path(hf_hub_download(SCICODE_HF_MIRROR_REPO, SCICODE_H5_FILENAME, repo_type="dataset"))
+    if not _h5_ok(local):
+        raise ValueError(f"espelho devolveu arquivo inválido ({local.stat().st_size} bytes)")
+    print("[scicode] Conferindo o espelho com o modo gold oficial (split validation)...")
+    check = run_scicode_gold_check(load_scicode_rows("validation"), local, timeout_s=300.0)
+    rate = check["n_pass"] / max(check["n_steps"], 1)
+    print(f"[scicode] gold: {check['n_pass']}/{check['n_steps']} passos passaram; falhas: {check['failed']}")
+    # Arquivo errado/adulterado reprova quase tudo; a folga cobre 1-2 passos sensíveis à versão de numpy/scipy.
+    if check["n_steps"] == 0 or rate < SCICODE_MIRROR_MIN_GOLD_RATE:
+        raise ValueError(f"espelho reprovado no gold ({check['n_pass']}/{check['n_steps']})")
+    tmp = target.with_suffix(".h5.part")
+    shutil.copyfile(local, tmp)
+    os.replace(tmp, target)
 
 
 def load_scicode_targets(step_id: str, n_tests: int, h5_path: str | Path) -> list[Any]:

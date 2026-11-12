@@ -1324,10 +1324,38 @@ def test_scicode_ensure_test_data_errors_clearly_and_accepts_valid_file() -> Non
             def download_folder(**kwargs):  # noqa: ANN003
                 raise OSError("cota do Drive excedida")
 
-        with mock.patch.dict("sys.modules", {"gdown": FakeGdown}):
+        import types as _types
+
+        def fake_hf(fn):  # noqa: ANN001
+            m = _types.ModuleType("huggingface_hub")
+            m.hf_hub_download = fn  # type: ignore[attr-defined]
+            return m
+
+        def hf_fails(*a, **k):  # noqa: ANN002, ANN003
+            raise OSError("sem rede")
+
+        # Drive e espelho falham => RuntimeError com instrução de download manual
+        with mock.patch.dict("sys.modules", {"gdown": FakeGdown, "huggingface_hub": fake_hf(hf_fails)}):
             with pytest.raises(RuntimeError) as exc:
                 scicode_eval.ensure_scicode_test_data(data_dir)
         assert "drive.google.com" in str(exc.value) and "test_data.h5" in str(exc.value)
+
+        # Drive falha, espelho válido: só é aceito se o gold check passar
+        mirror = Path(tmp) / "mirror" / "test_data.h5"
+        mirror.parent.mkdir()
+        with h5py.File(mirror, "w") as f:
+            f.create_dataset("1.1/test1/var1", data=np.ones(300_000))
+        mods = {"gdown": FakeGdown, "huggingface_hub": fake_hf(lambda *a, **k: str(mirror))}
+        with mock.patch.object(scicode_eval, "SCICODE_H5_MIN_BYTES", 1000), mock.patch.dict("sys.modules", mods), \
+                mock.patch.object(scicode_eval, "load_scicode_rows", lambda split: []):
+            with mock.patch.object(scicode_eval, "run_scicode_gold_check", lambda *a, **k: {"n_steps": 50, "n_pass": 10, "failed": []}):
+                with pytest.raises(RuntimeError):
+                    scicode_eval.ensure_scicode_test_data(data_dir)
+            assert not scicode_eval._h5_ok(data_dir / "test_data.h5")  # espelho reprovado não é gravado
+            with mock.patch.object(scicode_eval, "run_scicode_gold_check", lambda *a, **k: {"n_steps": 50, "n_pass": 50, "failed": []}):
+                assert scicode_eval.ensure_scicode_test_data(data_dir) == data_dir / "test_data.h5"
+        with h5py.File(data_dir / "test_data.h5", "r") as f:
+            assert float(f["1.1/test1/var1"][0]) == 1.0
 
 
 def _lcb_io(pairs: list[tuple[str, str]]) -> list[dict[str, str]]:
