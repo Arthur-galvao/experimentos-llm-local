@@ -244,7 +244,7 @@ O notebook de gate imprime `PASSOU` ou `REPROVOU` com os números. Se reprovar, 
 
 ## 5. Ordem de execução e checklist
 
-- [ ] F0: lib + teste de equivalência + baselines (Dory 1/2/4, Qwen3.5-4B)
+- [x] F0: lib + teste de equivalência + baselines (Dory 1/2/4, Qwen3.5-4B). Resultado em `RESULTADOS_F0.md`; base da F1 = Dory L2
 - [ ] F1a → F1b → F1c → **gate F1**
 - [ ] F2 → **gate F2**
 - [ ] F3a → **aprovação humana** → F3b → F3c → F3d → **gate F3**
