@@ -27,20 +27,22 @@ A configuração fixa de geração é a mesma do F0: `max_new_tokens=16000`, `te
 
 São 18 famílias de problemas de código, 6 por nível:
 
-| Nível | Famílias |
-|---|---|
-| easy | soma de dígitos filtrada, transformação do k-ésimo caractere, soma com filtro de resto, blocos repetidos, pares com soma divisível, ordenação por chave |
-| medium | janela com k letras distintas, união de intervalos com folga, espiral a partir de um canto, contagem de escadas mod M, menor caminho em grade (4/8 vizinhos/cavalo), maior trecho balanceado de parênteses |
-| hard | maior subsequência com diferença limitada, mochila com limite de itens, grade com passes grátis (Dijkstra com estado), intervalos com peso e folga, contagem de strings sem bloco longo, jogo de pilhas (Grundy) |
+| Nível | Para que serve | Famílias |
+|---|---|---|
+| easy | O Dory acerta tudo. Mede se ele pensa demais em problema simples (F1). | soma de dígitos filtrada, transformação do k-ésimo caractere, soma com filtro de resto, blocos repetidos, pares com soma divisível, ordenação por chave |
+| medium | O Dory acerta a maioria, e os loops se separam (na v1: L1 64%, L2 88%). Avisa cedo se uma fase quebra o raciocínio médio. | espiral a partir de um canto, contagem de escadas mod M, maior trecho balanceado de parênteses, grade com passes grátis (Dijkstra com estado), intervalos com peso e folga, jogo de pilhas (Grundy) |
+| hard | O Dory acerta pouco (alvo de 10% a 25%). É aqui que se vê se uma fase ganhou raciocínio ou só economizou tokens. | DP de dígitos com 3 condições até 10^18, strings sem padrões proibidos até 10^18 (autômato + potência de matriz), conjunto de nós de uma árvore com distância mínima (DP em árvore), menor número de trocas para agrupar valores (DP em bitmask sobre inversões), jogo de pilhas com divisão (Sprague-Grundy), subsequências distintas de tamanho k com restrição entre vizinhos |
+
+**Como ler o hard:** se o acerto do hard sobe, olhe o `hard_fail_breakdown`. Se só caiu o `truncated` (o modelo agora termina dentro de 16k tokens) e o `wrong_answer` não mudou, o ganho é de tokens, não de raciocínio. Ganho de raciocínio é o `wrong_answer` cair, ou acertar problemas que antes terminavam errados. No quick, o hard tem 42 problemas, e um a mais muda ~2,4 pontos. Para afirmar ganho no hard, use o `custom_full` (168 problemas no hard).
 
 - **Cada instância muda o problema, não só os nomes.** A semente sorteia parâmetros como o conjunto de passos, o tipo de movimento, o canto e o sentido da espiral, o limite de itens ou o módulo, e a resposta certa muda com eles.
 - **O enunciado traz restrições, dois exemplos e uma assinatura fixa.** A correção usa cerca de 14 testes escondidos por problema, com casos de borda. Nos níveis medium e hard há também entradas grandes, que reprovam força bruta exponencial. O limite é de 10 s por problema, folgado para não reprovar uma solução polinomial correta.
-- **É determinístico.** A mesma versão gera sempre os mesmos problemas. Qualquer mudança numa família exige subir `CUSTOM_PROTOCOL_ID`, o que invalida os resultados antigos em vez de misturá-los.
+- **É determinístico.** A mesma versão gera sempre os mesmos problemas. Qualquer mudança numa família exige subir `CUSTOM_PROTOCOL_ID`, o que invalida os resultados antigos em vez de misturá-los: o cache por problema é separado por versão, e a tabela e o gráfico só mostram a versão atual.
 
 ## Por que confiar na medição
 
 O `tests/test_custom_bench.py` verifica cinco coisas:
-1. Em cada família medium/hard, a solução de referência bate com uma **força bruta escrita de outro jeito** em pelo menos 100 entradas pequenas. A espiral, por exemplo, é conferida por rotação da matriz em vez de simulação.
+1. Em cada família medium/hard, a solução de referência bate com uma **força bruta escrita de outro jeito** em pelo menos 100 entradas pequenas. A espiral, por exemplo, é conferida por rotação da matriz em vez de simulação; o agrupamento por trocas, por BFS sobre as trocas; a árvore, testando todos os subconjuntos. Também verifica que a referência resolve cada problema em menos de 3 s, com folga para o limite de 10 s do sandbox.
 2. Os testes de cada problema **aceitam a referência e rejeitam uma resposta qualquer**, e nenhuma instância tem todas as saídas iguais.
 3. Determinismo, e `quick` é prefixo de `full`.
 4. O caminho completo funciona: gerador falso → `eval_custom` → sandbox → `results.jsonl`. Resposta truncada conta como erro, e uma segunda execução não duplica a linha.
@@ -59,9 +61,14 @@ Tudo fica no registro de `results.jsonl`: os campos padrão mais o `config`.
 | Estouro do orçamento | `{nível}_truncated_frac` | F1/F3 |
 | Tempo | `latency_mean_s` (por problema, amortizado no lote), `throughput_tok_s` | F2 (loops adaptativos), F5 (vocabulário) |
 | Loops | `n_loops` do registro (L1/L2/L4) | F2 |
-| Por que errou | `fail_breakdown`: `truncated`, `no_code`, `wrong_answer`, `timeout`, `runtime_error` | todas (diagnóstico) |
+| Por que errou | `fail_breakdown` e `{nível}_fail_breakdown`: `truncated`, `no_code`, `wrong_answer`, `timeout`, `runtime_error` | todas (diagnóstico); no hard, separa raciocínio de tokens |
 | Eficiência | `acerto_por_1k_tokens` e o gráfico `F0_pareto_custom_quick.png` | métrica central |
 
 Ainda não mede: VRAM (F5) e média de loops por token (F2 adaptativo), porque dependem do código dessas fases.
 
-Na primeira rodada, se uma família ficar em 0% ou 100% para todos os modelos, ela não separa nada. Nesse caso, ajuste os parâmetros da família e suba a versão.
+## Versões
+
+- **custom_v1** (commit 574a5c3): o Dory saturou. Easy 100%, hard ~90% no L2, e 12 das 18 famílias deram 100% em todos os loops. Pass@1 / CoT médio: L1 0.881 / 6486, L2 0.960 / 5974, L4 0.944 / 5848, Qwen 0.468 / 12292. A ordem foi a mesma dos benchmarks públicos.
+- **custom_v2** (atual): o easy ficou igual. O medium passou a ser formado pelas 6 famílias da v1 que separavam os loops. As 6 que davam sempre 100% saíram, e entraram 6 hard novas. A semente é a mesma, então o easy e as famílias que mudaram de nível geram as mesmas instâncias da v1.
+
+Depois de cada rodada de baselines, confira o `family_pass1`. No hard, uma família que fique em 0% para todos os loops não mede nada; nesse caso, alivie os parâmetros dela e suba a versão.

@@ -23,6 +23,7 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
     from lib.hw import get_hw_config
     from lib.io import DEFAULT_DRIVE_ROOT, ensure_model_files, setup_drive_and_cache
     from lib.metrics import plot_pareto
+    from lib.custom_bench import CUSTOM_PROTOCOL_ID
     from lib.registry import load_results
 
     paths = setup_drive_and_cache(drive_root=DEFAULT_DRIVE_ROOT, local_fallback_root=repo_root)
@@ -73,7 +74,11 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
         return
 
     if target == "plot":
-        f0_records = load_results(results_jsonl, phase="F0")
+        f0_records = [  # custom de versão antiga do benchmark não entra na tabela nem no gráfico
+            r for r in load_results(results_jsonl, phase="F0")
+            if not str(r.get("bench", "")).startswith("custom_")
+            or (r.get("config") or {}).get("eval_protocol") == CUSTOM_PROTOCOL_ID
+        ]
         print(f"Total de registros F0 em {results_jsonl}: {len(f0_records)}\n")
         header = (
             f"{'run_id':18s} | {'eval':6s} | {'bench':14s} | {'loops':5s} | "
@@ -98,7 +103,8 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
                     for t in ("easy", "medium", "hard")
                 )
                 print(
-                    f"\n{r['run_id']} {r['bench']}: {tiers}\n  cot nos acertos {cfg.get('tokens_cot_mean_correct')}"
+                    f"\n{r['run_id']} {r['bench']}: {tiers}\n  falhas no hard {cfg.get('hard_fail_breakdown')}"
+                    f" | cot nos acertos {cfg.get('tokens_cot_mean_correct')}"
                     f" | {cfg.get('throughput_tok_s')} tok/s | falhas {cfg.get('fail_breakdown')}"
                     f"\n  por família {cfg.get('family_pass1')}"
                 )

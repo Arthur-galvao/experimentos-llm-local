@@ -5,6 +5,10 @@ a semântica do problema (não só nomes), e os testes vêm da solução de refe
 família de medium/hard tem uma força bruta independente em `tests/test_custom_bench.py` que confere a
 referência. Determinístico: mesma semente => mesmos problemas; `quick` é um prefixo de `full`.
 
+Níveis (custom_v2): easy = Dory acerta tudo (mede pensar demais no simples); medium = Dory acerta
+a maioria e separa os loops; hard = técnicas não óbvias onde o Dory acerta pouco, para separar ganho de
+raciocínio de ganho só de tokens.
+
 Mede, por problema: acerto (testes escondidos), tokens de CoT/total, truncamento e latência; o
 `custom_extra_metrics` agrega por nível, por família e por tipo de falha.
 """
@@ -13,14 +17,15 @@ from __future__ import annotations
 
 import bisect
 import copy
+import functools
 import heapq
 import itertools
 import random
-from collections import Counter, deque
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable
 
-CUSTOM_PROTOCOL_ID = "custom_v1"  # mude ao alterar qualquer família: invalida resultados antigos
+CUSTOM_PROTOCOL_ID = "custom_v2"  # mude ao alterar qualquer família: invalida resultados antigos
 CUSTOM_SEED = "coder-comprimido-custom-v1"
 INSTANCES_PER_FAMILY = {"quick": 7, "full": 28}  # 18 famílias => 126 / 504 problemas
 SANDBOX_KWARGS = {"timeout_s": 10.0, "max_memory_mb": 1024}
@@ -215,84 +220,6 @@ def _sort_solve(p, words):
 # --------------------------------------------------------------------------------------- medium
 
 
-def _kd_params(rng):
-    k = rng.randint(1, 3)
-    return {"mode": rng.choice(["at most", "exactly"]), "k": k, "alpha": rng.randint(max(k + 1, 3), 6)}
-
-
-def _kd_desc(p):
-    letters = _LOWER[: p["alpha"]]
-    return (
-        "Return the length of the longest contiguous substring of `s` that contains "
-        f"{p['mode']} {p['k']} distinct characters (0 if there is no such non-empty substring).\n\n"
-        f"Constraints: 0 <= len(s) <= 2000; `s` uses only the letters '{letters[0]}' to '{letters[-1]}'."
-    )
-
-
-def _kd_inputs(rng, p):
-    letters = _LOWER[: p["alpha"]]
-    out = [(_word(rng, rng.randint(8, 12), letters),), (_word(rng, rng.randint(12, 16), letters),), ("",)]
-    out += [(letters[0],), (letters[0] * 5,)]
-    out += [(_word(rng, rng.randint(1, 60), letters),) for _ in range(8)]
-    return out + [(_word(rng, 2000, letters[: p["k"] + 1]),), (_word(rng, 2000, letters),)]
-
-
-def _kd_solve(p, s):
-    cnt: dict[str, int] = {}
-    left = best = 0
-    for right, ch in enumerate(s):
-        cnt[ch] = cnt.get(ch, 0) + 1
-        while len(cnt) > p["k"]:
-            c = s[left]
-            cnt[c] -= 1
-            if not cnt[c]:
-                del cnt[c]
-            left += 1
-        if p["mode"] == "at most" or len(cnt) == p["k"]:
-            best = max(best, right - left + 1)
-    return best
-
-
-def _mg_params(rng):
-    return {"g": rng.randint(0, 5)}
-
-
-def _mg_desc(p):
-    return (
-        "Each interval [start, end] of `intervals` has start <= end. Repeatedly merge any two intervals "
-        f"whose gap is at most {p['g']}, where the gap between [a, b] and [c, d] is max(a, c) - min(b, d) "
-        "(zero or negative when they touch or overlap); the two are replaced by [min(a, c), max(b, d)]. "
-        "When no more merges are possible, return the sum of (end - start) over the remaining intervals. "
-        "The input is not sorted. Return 0 for an empty list.\n\n"
-        "Constraints: 0 <= len(intervals) <= 2000, 0 <= start <= end <= 10**6."
-    )
-
-
-def _mg_inputs(rng, p):
-    def ivs(n, hi, maxlen):
-        out = []
-        for _ in range(n):
-            s = rng.randint(0, hi)
-            out.append([s, min(hi, s + rng.randint(0, maxlen))])
-        return out
-
-    out = [(ivs(4, 30, 6),), (ivs(6, 40, 6),), ([],), ([[5, 5]],), ([[0, 3], [3 + p["g"], 9]],)]
-    out += [(ivs(rng.randint(1, 12), 60, 8),) for _ in range(8)]
-    return out + [(ivs(2000, 10**6, 1000),), (ivs(2000, 10**6, 300),)]
-
-
-def _mg_solve(p, intervals):
-    total, cur = 0, None
-    for s, e in sorted(map(tuple, intervals)):
-        if cur is not None and s - cur[1] <= p["g"]:
-            cur[1] = max(cur[1], e)
-        else:
-            if cur is not None:
-                total += cur[1] - cur[0]
-            cur = [s, e]
-    return total + (cur[1] - cur[0] if cur is not None else 0)
-
-
 _DIR_NAMES = ["right", "down", "left", "up"]
 _DIRS = [(0, 1), (1, 0), (0, -1), (-1, 0)]
 _SPIRAL_START = {  # (canto, rotação) -> direção inicial, sempre ao longo da borda
@@ -352,7 +279,6 @@ def _sp_solve(p, matrix):
                 raise AssertionError("spiral: a curva leva a uma célula inválida (enunciado ambíguo)")
         r, c = r + _DIRS[d][0], c + _DIRS[d][1]
 
-
 _MODS = [10**9 + 7, 998244353, 10**9 + 9, 1000003]
 
 
@@ -380,67 +306,6 @@ def _steps_solve(p, n):
     for i in range(1, n + 1):
         dp[i] = sum(dp[i - s] for s in p["steps"] if s <= i) % p["mod"]
     return dp[n]
-
-
-_MOVES = {
-    "4": ("to one of the 4 side-adjacent cells", [(0, 1), (1, 0), (0, -1), (-1, 0)]),
-    "8": (
-        "to one of the 8 adjacent cells (diagonals included)",
-        [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc],
-    ),
-    "knight": (
-        "like a chess knight: 2 cells in one direction and 1 cell in a perpendicular direction, jumping "
-        "over whatever is in between",
-        [(a, b) for a in (-2, -1, 1, 2) for b in (-2, -1, 1, 2) if abs(a) != abs(b)],
-    ),
-}
-
-
-def _gp_params(rng):
-    return {"moves": rng.choice(sorted(_MOVES))}
-
-
-def _gp_desc(p):
-    return (
-        "`grid` is a list of equal-length strings; grid[r][c] is '.' (free) or '#' (blocked). Starting at "
-        "the top-left cell (0, 0), reach the bottom-right cell with the fewest moves, where one move goes "
-        f"{_MOVES[p['moves']][0]}. You may only stand on free cells and never leave the grid. Return the "
-        "minimum number of moves, or -1 if it is impossible (also when the start or the target cell is "
-        "blocked). A 1x1 grid whose cell is free has answer 0.\n\n"
-        "Constraints: 1 <= number of rows, number of columns <= 30."
-    )
-
-
-def _gp_grid(rng, rows, cols, density, free_ends=True):
-    g = [["#" if rng.random() < density else "." for _ in range(cols)] for _ in range(rows)]
-    if free_ends:
-        g[0][0] = g[rows - 1][cols - 1] = "."
-    return ["".join(r) for r in g]
-
-
-def _gp_inputs(rng, p):
-    out = [(_gp_grid(rng, 4, 5, 0.25),), (_gp_grid(rng, 5, 6, 0.3),), (["."],), (["#."],), (["..", ".#"],)]
-    out += [(_gp_grid(rng, rng.randint(1, 8), rng.randint(1, 8), rng.choice([0.15, 0.3, 0.45])),) for _ in range(8)]
-    return out + [(_gp_grid(rng, 30, 30, 0.3),), (_gp_grid(rng, 30, 30, 0.2),)]
-
-
-def _gp_solve(p, grid):
-    rows, cols = len(grid), len(grid[0])
-    if grid[0][0] == "#" or grid[rows - 1][cols - 1] == "#":
-        return -1
-    dist = {(0, 0): 0}
-    q = deque([(0, 0)])
-    while q:
-        r, c = q.popleft()
-        if (r, c) == (rows - 1, cols - 1):
-            return dist[(r, c)]
-        for dr, dc in _MOVES[p["moves"]][1]:
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < rows and 0 <= nc < cols and grid[nr][nc] == "." and (nr, nc) not in dist:
-                dist[(nr, nc)] = dist[(r, c)] + 1
-                q.append((nr, nc))
-    return -1
-
 
 _BRACKETS = ["()", "()[]", "()[]{}"]
 
@@ -500,76 +365,6 @@ def _br_solve(p, s):
         else:
             stack.append(i)
     return best
-
-
-# ----------------------------------------------------------------------------------------- hard
-
-
-def _chain_params(rng):
-    lo = rng.randint(-3, 2)
-    return {"lo": lo, "hi": lo + rng.randint(0, 4)}
-
-
-def _chain_desc(p):
-    return (
-        "Return the length of the longest subsequence of `nums` (elements kept in their original order, "
-        "not necessarily contiguous) in which every element minus the element before it is between "
-        f"{p['lo']} and {p['hi']} inclusive. A single element is a valid subsequence; return 0 for an empty "
-        "list.\n\nConstraints: 0 <= len(nums) <= 1000, -50 <= nums[i] <= 50."
-    )
-
-
-def _chain_inputs(rng, p):
-    rnd = lambda n, v: [rng.randint(-v, v) for _ in range(n)]  # noqa: E731
-    out = [(rnd(rng.randint(6, 9), 10),), (rnd(rng.randint(8, 11), 10),), ([],), ([3],)]
-    out += [(rnd(rng.randint(1, 12), 8),) for _ in range(8)]
-    return out + [(rnd(1000, 50),), (rnd(1000, 15),)]
-
-
-def _chain_solve(p, nums):
-    best: dict[int, int] = {}
-    ans = 0
-    for x in nums:
-        cur = 1 + max((best.get(x - d, 0) for d in range(p["lo"], p["hi"] + 1)), default=0)
-        best[x] = max(best.get(x, 0), cur)
-        ans = max(ans, cur)
-    return ans
-
-
-def _knap_params(rng):
-    return {"c": rng.randint(2, 6)}
-
-
-def _knap_desc(p):
-    return (
-        "Item i has weight weights[i] and value values[i]. Choose a subset of the items (each item at most "
-        f"once) with total weight at most `capacity` and at most {p['c']} items. Return the maximum total "
-        "value (0 if nothing can be chosen).\n\nConstraints: 0 <= len(weights) == len(values) <= 40, "
-        "1 <= weights[i] <= 50, 1 <= values[i] <= 100, 0 <= capacity <= 500."
-    )
-
-
-def _knap_inputs(rng, p):
-    def items(n, wmax, cap):
-        return ([rng.randint(1, wmax) for _ in range(n)], [rng.randint(1, 100) for _ in range(n)], cap)
-
-    out = [items(rng.randint(4, 6), 15, rng.randint(10, 40)), items(rng.randint(5, 7), 20, rng.randint(15, 50))]
-    out += [([], [], 10), items(3, 10, 0), ([5] * 8, list(range(10, 90, 10)), 40)]
-    out += [items(rng.randint(1, 10), 20, rng.randint(0, 60)) for _ in range(7)]
-    return out + [items(40, 50, 500), items(40, 50, 120)]
-
-
-def _knap_solve(p, weights, values, capacity):
-    dp = [[-1] * (capacity + 1) for _ in range(p["c"] + 1)]  # dp[k][w]: melhor valor com k itens e peso w
-    dp[0][0] = 0
-    for wt, v in zip(weights, values):
-        for k in range(p["c"], 0, -1):
-            prev, row = dp[k - 1], dp[k]
-            for w in range(capacity, wt - 1, -1):
-                if prev[w - wt] >= 0 and prev[w - wt] + v > row[w]:
-                    row[w] = prev[w - wt] + v
-    return max(max(r) for r in dp)
-
 
 def _pass_params(rng):
     return {"K": rng.randint(0, 3)}
@@ -654,42 +449,6 @@ def _wi_solve(p, intervals):
     return dp[-1]
 
 
-_MOD = 10**9 + 7
-
-
-def _rc_params(rng):
-    return {"a": rng.randint(2, 5), "r": rng.randint(1, 4)}
-
-
-def _rc_desc(p):
-    return (
-        f"Count the strings of length `n` over an alphabet of {p['a']} letters in which every block of equal "
-        f"consecutive letters has length at most {p['r']}. Return the count modulo 1000000007. "
-        "For n = 0 the answer is 1.\n\n"
-        "Constraints: 0 <= n <= 1000."
-    )
-
-
-def _rc_inputs(rng, p):
-    out = [(rng.randint(3, 4),), (rng.randint(5, 6),), (0,), (1,), (p["r"],), (p["r"] + 1,)]
-    out += [(rng.randint(0, 6),) for _ in range(4)]
-    return out + [(rng.randint(20, 60),), (1000,), (999,)]
-
-
-def _rc_solve(p, n):
-    if n == 0:
-        return 1
-    ends = [0] * (p["r"] + 1)  # ends[j]: strings terminando num bloco de tamanho j
-    ends[1] = p["a"]
-    for _ in range(n - 1):
-        new = [0] * (p["r"] + 1)
-        new[1] = sum(ends) * (p["a"] - 1) % _MOD
-        for j in range(2, p["r"] + 1):
-            new[j] = ends[j - 1]
-        ends = new
-    return sum(ends) % _MOD
-
-
 def _game_params(rng):
     return {"moves": sorted(rng.sample(range(1, 10), rng.randint(2, 4)))}
 
@@ -725,6 +484,324 @@ def _game_solve(p, piles):
     return acc != 0
 
 
+# ----------------------------------------------------------------------------------------- hard
+
+
+_MOD = 10**9 + 7
+
+# Nível hard: técnica não óbvia (DP de dígitos, autômato + potência de matriz, DP em árvore com
+# distância, DP em bitmask sobre custos de inversão, Sprague-Grundy com divisão, autômato de
+# subsequências) + entradas grandes que reprovam força bruta. Alvo: Dory acerta pouco.
+
+
+def _dd_params(rng):
+    return {"m": rng.randint(2, 9), "q": rng.randint(2, 13), "D": rng.randint(1, 3)}
+
+
+def _dd_desc(p):
+    return (
+        "Count the integers x with lo <= x <= hi such that all three conditions hold: the sum of the "
+        f"decimal digits of x is divisible by {p['m']}; x is divisible by {p['q']}; and every two adjacent "
+        f"digits of x differ by at least {p['D']} (x written in decimal without leading zeros; a one-digit "
+        "number has no adjacent digits, and 0 is the one-digit number 0).\n\n"
+        "Constraints: 0 <= lo <= hi <= 10**18."
+    )
+
+
+def _dd_inputs(rng, p):
+    def rng_pair(lo_max, width):
+        lo = rng.randint(0, lo_max)
+        return (lo, lo + rng.randint(0, width))
+
+    out = [rng_pair(100, 400), rng_pair(1000, 2000), (0, 0), (7, 7), (0, 3000)]
+    out += [rng_pair(3000, 3000) for _ in range(7)]
+    big = rng.randint(10**17, 10**18 // 2)
+    return out + [(0, 10**18), (big, rng.randint(big, 10**18))]
+
+
+def _dd_solve(p, lo, hi):
+    m, q, D = p["m"], p["q"], p["D"]
+
+    @functools.lru_cache(None)
+    def free(r, prev, sm, md):  # r dígitos ainda livres depois do dígito `prev`
+        if r == 0:
+            return int(sm == 0 and md == 0)
+        return sum(free(r - 1, d, (sm + d) % m, (md * 10 + d) % q) for d in range(10) if abs(d - prev) >= D)
+
+    def upto(n):  # quantos x em [0, n]
+        if n < 0:
+            return 0
+        if n == 0:
+            return 1
+        s = str(n)
+        total = 1 + sum(free(length - 1, d, d % m, d % q) for length in range(1, len(s)) for d in range(1, 10))
+        prev = sm = md = 0
+        for i, ch in enumerate(s):
+            top = int(ch)
+            for d in range(1 if i == 0 else 0, top):
+                if i == 0 or abs(d - prev) >= D:
+                    total += free(len(s) - i - 1, d, (sm + d) % m, (md * 10 + d) % q)
+            if i and abs(top - prev) < D:
+                return total
+            prev, sm, md = top, (sm + top) % m, (md * 10 + top) % q
+        return total + int(sm == 0 and md == 0)
+
+    return upto(hi) - upto(lo - 1)
+
+
+def _fp_params(rng):
+    a = rng.randint(2, 3)
+    pats: set[str] = set()
+    target = rng.randint(2, 3)
+    while len(pats) < target:
+        pats.add(_word(rng, rng.randint(2, 4), _LOWER[:a]))
+    return {"a": a, "patterns": sorted(pats)}
+
+
+def _fp_desc(p):
+    letters = ", ".join(repr(c) for c in _LOWER[: p["a"]])
+    return (
+        f"Count the strings of length `n` over the alphabet {{{letters}}} that do not contain any of the "
+        f"strings {p['patterns']} as a contiguous substring. Return the count modulo 1000000007. For n = 0 "
+        "the answer is 1 (the empty string).\n\nConstraints: 0 <= n <= 10**18."
+    )
+
+
+def _fp_inputs(rng, p):
+    out = [(rng.randint(3, 4),), (rng.randint(5, 6),), (0,), (1,), (2,)]
+    out += [(rng.randint(0, 8),) for _ in range(6)]
+    return out + [(rng.randint(1000, 5000),), (rng.randint(10**17, 10**18),), (10**18,)]
+
+
+def _fp_solve(p, n):
+    alpha, pats = _LOWER[: p["a"]], p["patterns"]
+    prefixes = sorted({x[:i] for x in pats for i in range(len(x))})  # estados vivos (nenhum padrão completo)
+    idx = {s: i for i, s in enumerate(prefixes)}
+    size = len(prefixes)
+    mat = [[0] * size for _ in range(size)]
+    for s in prefixes:
+        for c in alpha:
+            w = s + c
+            if any(w.endswith(x) for x in pats):
+                continue
+            nxt = next(w[k:] for k in range(len(w) + 1) if w[k:] in idx)
+            mat[idx[s]][idx[nxt]] += 1
+
+    def mul(x, y):
+        return [[sum(x[i][k] * y[k][j] for k in range(size)) % _MOD for j in range(size)] for i in range(len(x))]
+
+    vec = [[int(i == idx[""]) for i in range(size)]]
+    while n:
+        if n & 1:
+            vec = mul(vec, mat)
+        mat = mul(mat, mat)
+        n >>= 1
+    return sum(vec[0]) % _MOD
+
+
+def _ts_params(rng):
+    return {"d": rng.randint(2, 4)}
+
+
+def _ts_desc(p):
+    return (
+        "A tree has n nodes numbered 0 to n-1 and the n-1 undirected edges in `edges`; weights[i] is the "
+        "weight of node i. Choose a set of nodes such that the distance (number of edges on the path) "
+        f"between any two chosen nodes is greater than {p['d']}. Return the maximum possible total weight "
+        "of the chosen nodes.\n\nConstraints: 1 <= n <= 2000, 1 <= weights[i] <= 1000."
+    )
+
+
+def _ts_tree(rng, n, span):
+    """Árvore aleatória com rótulos e arestas embaralhados (span pequeno => árvore funda)."""
+    perm = list(range(n))
+    rng.shuffle(perm)
+    edges = []
+    for i in range(1, n):
+        a, b = perm[i], perm[rng.randint(max(0, i - span), i - 1)]
+        edges.append([a, b] if rng.random() < 0.5 else [b, a])
+    rng.shuffle(edges)
+    return (n, edges, [rng.randint(1, 1000 if n > 12 else 20) for _ in range(n)])
+
+
+def _ts_inputs(rng, p):
+    out = [_ts_tree(rng, rng.randint(6, 8), 3), _ts_tree(rng, rng.randint(8, 10), 10), (1, [], [5])]
+    out += [(6, [[i, i + 1] for i in range(5)], [rng.randint(1, 20) for _ in range(6)])]
+    out += [(7, [[0, i] for i in range(1, 7)], [rng.randint(1, 20) for _ in range(7)])]
+    out += [_ts_tree(rng, rng.randint(2, 12), rng.choice([1, 2, 12])) for _ in range(7)]
+    return out + [_ts_tree(rng, 2000, 2000), _ts_tree(rng, 1500, 3)]
+
+
+def _ts_solve(p, n, edges, weights):
+    K = p["d"] + 1  # distância mínima permitida entre escolhidos
+    adj: list[list[int]] = [[] for _ in range(n)]
+    for a, b in edges:
+        adj[a].append(b)
+        adj[b].append(a)
+    order, parent = [0], [-1] * n
+    for v in order:
+        for u in adj[v]:
+            if u != parent[v]:
+                parent[u] = v
+                order.append(u)
+    F: list[list[int]] = [[]] * n  # F[v][i]: melhor peso na subárvore com escolhidos a profundidade >= i
+    for v in reversed(order):
+        ch = [F[u] for u in adj[v] if u != parent[v]]
+        f = [0] * (K + 1)
+        f[K] = sum(c[K - 1] for c in ch)
+        for i in range(K - 1, 0, -1):
+            f[i] = f[i + 1]
+            if ch:
+                mi = max(i - 1, K - i - 1)
+                f[i] = max(f[i], sum(c[mi] for c in ch) + max(c[i - 1] - c[mi] for c in ch))
+        f[0] = max(weights[v] + f[K], f[1])
+        F[v] = f
+    return F[0][0]
+
+
+def _gc_params(rng):
+    c = rng.randint(3, 7)
+    return {"c": c, "first": rng.choice([None, rng.randint(0, c - 1)])}
+
+
+def _gc_desc(p):
+    extra = (
+        f", and the occurrences of the value {p['first']} (if any) come before every other element"
+        if p["first"] is not None
+        else ""
+    )
+    return (
+        f"`nums` contains integers from 0 to {p['c'] - 1}. In one operation you may swap two adjacent "
+        "elements. Return the minimum number of operations needed so that, for every value, all of its "
+        f"occurrences form one contiguous block{extra}.\n\nConstraints: 0 <= len(nums) <= 10**5."
+    )
+
+
+def _gc_inputs(rng, p):
+    rnd = lambda n: [rng.randrange(p["c"]) for _ in range(n)]  # noqa: E731
+    out = [(rnd(6),), (rnd(7),), ([],), ([0],), ([1, 1, 1],)]
+    out += [(rnd(rng.randint(1, 7)),) for _ in range(8)]
+    blocks = [x for _ in range(400) for x in [rng.randrange(p["c"])] * rng.randint(1, 500)][: 10**5]
+    return out + [(rnd(10**5),), (blocks,)]
+
+
+def _gc_solve(p, nums):
+    c = p["c"]
+    cost = [[0] * c for _ in range(c)]  # cost[a][b]: pares (b antes de a) a desfazer se o bloco a vier antes de b
+    seen = [0] * c
+    for x in nums:
+        row = cost[x]
+        for b in range(c):
+            row[b] += seen[b]
+        seen[x] += 1
+    full = (1 << c) - 1
+    inf = float("inf")
+    dp = [inf] * (1 << c)
+    start = 0 if p["first"] is None else 1 << p["first"]
+    dp[start] = 0 if p["first"] is None else sum(cost[p["first"]][b] for b in range(c) if b != p["first"])
+    for mask in range(1 << c):
+        if dp[mask] == inf:
+            continue
+        for a in range(c):
+            if not mask >> a & 1:
+                new = dp[mask] + sum(cost[a][b] for b in range(c) if b != a and not mask >> b & 1)
+                if new < dp[mask | 1 << a]:
+                    dp[mask | 1 << a] = new
+    return dp[full]
+
+
+def _sg_params(rng):
+    return {"moves": sorted(rng.sample(range(1, 6), rng.randint(1, 3))), "split": rng.choice(["unequal", "any"])}
+
+
+def _sg_desc(p):
+    how = "two non-empty piles of different sizes" if p["split"] == "unequal" else "two non-empty piles (of any sizes)"
+    return (
+        "Two players alternate turns on the piles of stones in `piles`. On a turn the player chooses one pile "
+        f"and either removes exactly s stones from it, for some s in {p['moves']} with s <= the size of that "
+        f"pile, or splits it into {how}. The player who cannot make a move loses. Both play optimally. "
+        "Return True if the player who moves first wins, otherwise False.\n\n"
+        "Constraints: 1 <= len(piles) <= 5, 0 <= piles[i] <= 1000."
+    )
+
+
+def _sg_inputs(rng, p):
+    def small():
+        piles = [rng.randint(0, 6) for _ in range(rng.randint(1, 3))]
+        while sum(piles) > 9:
+            piles[piles.index(max(piles))] -= 1
+        return (piles,)
+
+    out = [small(), small(), ([0],), ([1],), ([2],), ([3],)]
+    out += [small() for _ in range(7)]
+    return out + [([rng.randint(0, 1000) for _ in range(5)],), ([rng.randint(500, 1000) for _ in range(4)],)]
+
+
+def _sg_solve(p, piles):
+    top = max(piles, default=0)
+    gr = [0] * (top + 1)
+    for x in range(1, top + 1):
+        seen = {gr[x - s] for s in p["moves"] if s <= x}
+        seen |= {gr[a] ^ gr[x - a] for a in range(1, x // 2 + 1) if p["split"] == "any" or 2 * a != x}
+        g = 0
+        while g in seen:
+            g += 1
+        gr[x] = g
+    acc = 0
+    for x in piles:
+        acc ^= gr[x]
+    return acc != 0
+
+
+_RULES = {
+    "equal": "are equal",
+    "consecutive": "are consecutive letters of the alphabet (such as 'b' and 'c', in either order)",
+}
+
+
+def _ds_params(rng):
+    rule = rng.choice(sorted(_RULES))  # alfabeto grande o bastante para a contagem não zerar
+    return {"rule": rule, "a": rng.randint(3, 5) if rule == "equal" else rng.randint(4, 6)}
+
+
+def _ds_desc(p):
+    return (
+        "Count the distinct strings t of length exactly k such that t is a subsequence of s (characters "
+        "taken in order, not necessarily contiguous) and no two adjacent characters of t "
+        f"{_RULES[p['rule']]}. Each different string counts once, however many ways it can be taken from s. "
+        "Return the count modulo 1000000007. For k = 0 the answer is 1 (the empty string).\n\n"
+        "Constraints: 1 <= len(s) <= 500, 0 <= k <= len(s), s consists of lowercase English letters."
+    )
+
+
+def _ds_inputs(rng, p):
+    letters = _LOWER[: p["a"]]
+    w = lambda n: _word(rng, n, letters)  # noqa: E731
+    out = [(w(rng.randint(5, 7)), rng.randint(2, 3)), (w(rng.randint(7, 9)), rng.randint(3, 4))]
+    out += [(w(4), 0), (letters[0] * 5, 1), (letters[0] * 5, 2), (w(6), 6)]
+    out += [(lambda s: (s, rng.randint(0, len(s))))(w(rng.randint(1, 12))) for _ in range(7)]
+    return out + [(w(500), rng.randint(60, 150)), (w(500), rng.randint(150, 250))]
+
+
+def _ds_solve(p, s, k):
+    if k == 0:
+        return 1
+    n = len(s)
+    bad = (lambda x, y: x == y) if p["rule"] == "equal" else (lambda x, y: abs(ord(x) - ord(y)) == 1)
+    nxt = [dict() for _ in range(n + 1)]  # nxt[i][c]: primeira posição j >= i com s[j] == c
+    for i in range(n - 1, -1, -1):
+        nxt[i] = dict(nxt[i + 1])
+        nxt[i][s[i]] = i
+    # f[i]: quantas continuações de comprimento r existem depois de escolher s[i] (casamento guloso)
+    f = [1] * n
+    for _ in range(k - 1):
+        f = [
+            sum(f[j] for c, j in nxt[i + 1].items() if not bad(s[i], c)) % _MOD
+            for i in range(n)
+        ]
+    return sum(f[j] for j in nxt[0].values()) % _MOD
+
+
 FAMILIES: list[Family] = [
     Family("digit_sum", "easy", "def digit_sum(n: int) -> int:", _digit_params, _digit_desc, _digit_inputs, _digit_solve),
     Family("kth_char", "easy", "def transform(s: str) -> str:", _kth_params, _kth_desc, _kth_inputs, _kth_solve),
@@ -732,18 +809,18 @@ FAMILIES: list[Family] = [
     Family("long_runs", "easy", "def long_runs(s: str) -> list:", _runs_params, _runs_desc, _runs_inputs, _runs_solve),
     Family("pair_count", "easy", "def count_pairs(nums: list[int]) -> int:", _pairs_params, _pairs_desc, _pairs_inputs, _pairs_solve),
     Family("sort_words", "easy", "def sort_words(words: list[str]) -> list[str]:", _sort_params, _sort_desc, _sort_inputs, _sort_solve),
-    Family("k_distinct", "medium", "def longest_window(s: str) -> int:", _kd_params, _kd_desc, _kd_inputs, _kd_solve),
-    Family("merge_gap", "medium", "def covered_length(intervals: list[list[int]]) -> int:", _mg_params, _mg_desc, _mg_inputs, _mg_solve),
     Family("spiral", "medium", "def spiral(matrix: list[list[int]]) -> list[int]:", _sp_params, _sp_desc, _sp_inputs, _sp_solve),
     Family("step_ways", "medium", "def count_ways(n: int) -> int:", _steps_params, _steps_desc, _steps_inputs, _steps_solve),
-    Family("grid_path", "medium", "def shortest_path(grid: list[str]) -> int:", _gp_params, _gp_desc, _gp_inputs, _gp_solve),
     Family("brackets", "medium", "def longest_balanced(s: str) -> int:", _br_params, _br_desc, _br_inputs, _br_solve),
-    Family("diff_chain", "hard", "def longest_chain(nums: list[int]) -> int:", _chain_params, _chain_desc, _chain_inputs, _chain_solve),
-    Family("knapsack_k", "hard", "def best_value(weights: list[int], values: list[int], capacity: int) -> int:", _knap_params, _knap_desc, _knap_inputs, _knap_solve),
-    Family("grid_passes", "hard", "def min_cost(grid: list[list[int]]) -> int:", _pass_params, _pass_desc, _pass_inputs, _pass_solve),
-    Family("intervals_gap", "hard", "def max_weight(intervals: list[list[int]]) -> int:", _wi_params, _wi_desc, _wi_inputs, _wi_solve),
-    Family("run_count", "hard", "def count_strings(n: int) -> int:", _rc_params, _rc_desc, _rc_inputs, _rc_solve),
-    Family("pile_game", "hard", "def first_player_wins(piles: list[int]) -> bool:", _game_params, _game_desc, _game_inputs, _game_solve),
+    Family("grid_passes", "medium", "def min_cost(grid: list[list[int]]) -> int:", _pass_params, _pass_desc, _pass_inputs, _pass_solve),
+    Family("intervals_gap", "medium", "def max_weight(intervals: list[list[int]]) -> int:", _wi_params, _wi_desc, _wi_inputs, _wi_solve),
+    Family("pile_game", "medium", "def first_player_wins(piles: list[int]) -> bool:", _game_params, _game_desc, _game_inputs, _game_solve),
+    Family("digit_count", "hard", "def count_numbers(lo: int, hi: int) -> int:", _dd_params, _dd_desc, _dd_inputs, _dd_solve),
+    Family("avoid_patterns", "hard", "def count_strings(n: int) -> int:", _fp_params, _fp_desc, _fp_inputs, _fp_solve),
+    Family("tree_spread", "hard", "def max_weight(n: int, edges: list[list[int]], weights: list[int]) -> int:", _ts_params, _ts_desc, _ts_inputs, _ts_solve),
+    Family("group_values", "hard", "def min_swaps(nums: list[int]) -> int:", _gc_params, _gc_desc, _gc_inputs, _gc_solve),
+    Family("split_game", "hard", "def first_player_wins(piles: list[int]) -> bool:", _sg_params, _sg_desc, _sg_inputs, _sg_solve),
+    Family("distinct_subseq", "hard", "def count_subsequences(s: str, k: int) -> int:", _ds_params, _ds_desc, _ds_inputs, _ds_solve),
 ]
 
 
@@ -814,6 +891,8 @@ def custom_extra_metrics(rows_by_id: dict[str, dict[str, Any] | None]) -> dict[s
         out[f"{tier}_pass1"] = mean(float(bool(r.get("passed"))) for r in rs)
         out[f"{tier}_tokens_cot_mean"] = mean(float(r.get("n_cot_tokens", 0)) for r in rs)
         out[f"{tier}_truncated_frac"] = mean(float(bool(r.get("truncated"))) for r in rs)
+        # no hard separa "errou o raciocínio" (wrong_answer/timeout) de "só não coube no orçamento" (truncated)
+        out[f"{tier}_fail_breakdown"] = dict(Counter(_fail_bucket(r) for r in rs if not r.get("passed")))
     ok = [r for r in rows.values() if r.get("passed")]
     out["tokens_cot_mean_correct"] = mean(float(r.get("n_cot_tokens", 0)) for r in ok)
     lat = sum(float(r.get("latency_s", 0.0)) for r in rows.values())

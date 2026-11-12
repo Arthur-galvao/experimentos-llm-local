@@ -4,10 +4,12 @@ discriminam, determinismo e o caminho completo pelo sandbox."""
 from __future__ import annotations
 
 import itertools
+import time
 import unittest
 from functools import lru_cache
 
 from lib.custom_bench import (
+    CUSTOM_PROTOCOL_ID,
     FAMILIES,
     INSTANCES_PER_FAMILY,
     _SPIRAL_START,
@@ -19,31 +21,6 @@ from lib.sandbox import check_solution
 
 
 # ---------------------------------------------------------------- forças brutas (só entradas pequenas)
-
-
-def _kd(p, s):
-    best = 0
-    for i in range(len(s)):
-        for j in range(i, len(s)):
-            d = len(set(s[i : j + 1]))
-            if d <= p["k"] and (p["mode"] == "at most" or d == p["k"]):
-                best = max(best, j - i + 1)
-    return best
-
-
-def _mg(p, intervals):
-    iv = [list(x) for x in intervals]
-    merged = True
-    while merged:
-        merged = False
-        for i, j in itertools.combinations(range(len(iv)), 2):
-            (a, b), (c, d) = iv[i], iv[j]
-            if max(a, c) - min(b, d) <= p["g"]:
-                iv[i] = [min(a, c), max(b, d)]
-                iv.pop(j)
-                merged = True
-                break
-    return sum(e - s for s, e in iv)
 
 
 def _spiral_tl_cw(m):
@@ -80,23 +57,6 @@ def _steps(p, n):
     return w(n) % p["mod"]
 
 
-def _gp(p, grid):
-    from lib.custom_bench import _MOVES
-
-    rows, cols = len(grid), len(grid[0])
-    if grid[0][0] == "#" or grid[-1][-1] == "#":
-        return -1
-    inf = float("inf")
-    dist = {(r, c): inf for r in range(rows) for c in range(cols) if grid[r][c] == "."}
-    dist[(0, 0)] = 0
-    for _ in range(len(dist)):
-        for (r, c), d in list(dist.items()):
-            for dr, dc in _MOVES[p["moves"]][1]:
-                if (r + dr, c + dc) in dist and d + 1 < dist[(r + dr, c + dc)]:
-                    dist[(r + dr, c + dc)] = d + 1
-    return -1 if dist[(rows - 1, cols - 1)] == inf else dist[(rows - 1, cols - 1)]
-
-
 def _br(p, s):
     pairs = [p["pairs"][i : i + 2] for i in range(0, len(p["pairs"]), 2)]
 
@@ -109,24 +69,6 @@ def _br(p, s):
         return t == ""
 
     return max((j - i for i in range(len(s) + 1) for j in range(i, len(s) + 1) if balanced(s[i:j])), default=0)
-
-
-def _chain(p, nums):
-    best = 0
-    for mask in range(1 << len(nums)):
-        sub = [x for i, x in enumerate(nums) if mask >> i & 1]
-        if all(p["lo"] <= b - a <= p["hi"] for a, b in zip(sub, sub[1:])):
-            best = max(best, len(sub))
-    return best
-
-
-def _knap(p, weights, values, capacity):
-    best = 0
-    for k in range(min(p["c"], len(weights)) + 1):
-        for combo in itertools.combinations(range(len(weights)), k):
-            if sum(weights[i] for i in combo) <= capacity:
-                best = max(best, sum(values[i] for i in combo))
-    return best
 
 
 def _pass(p, grid):
@@ -158,11 +100,6 @@ def _wi(p, intervals):
     return best
 
 
-def _rc(p, n):
-    ok = lambda t: all(len(list(g)) <= p["r"] for _, g in itertools.groupby(t))  # noqa: E731
-    return sum(ok(t) for t in itertools.product(range(p["a"]), repeat=n)) % (10**9 + 7)
-
-
 def _game(p, piles):
     @lru_cache(None)
     def win(state):
@@ -175,19 +112,95 @@ def _game(p, piles):
     return win(tuple(sorted(piles)))
 
 
+def _dd(p, lo, hi):
+    def ok(x):
+        t = str(x)
+        return (sum(map(int, t)) % p["m"] == 0 and x % p["q"] == 0
+                and all(abs(int(a) - int(b)) >= p["D"] for a, b in zip(t, t[1:])))
+
+    return sum(ok(x) for x in range(lo, hi + 1))
+
+
+def _fp(p, n):
+    alpha = "abcdefghijklmnopqrstuvwxyz"[: p["a"]]
+    return sum(not any(x in "".join(t) for x in p["patterns"]) for t in itertools.product(alpha, repeat=n))
+
+
+def _ts(p, n, edges, weights):
+    adj = {v: [] for v in range(n)}
+    for a, b in edges:
+        adj[a].append(b)
+        adj[b].append(a)
+    dist = {}
+    for s0 in range(n):  # BFS de cada nó
+        d, frontier = {s0: 0}, [s0]
+        for v in frontier:
+            for u in adj[v]:
+                if u not in d:
+                    d[u] = d[v] + 1
+                    frontier.append(u)
+        dist[s0] = d
+    assert all(len(dist[v]) == n for v in range(n))  # é conexa (árvore)
+    best = 0
+    for mask in range(1 << n):
+        chosen = [v for v in range(n) if mask >> v & 1]
+        if all(dist[a][b] > p["d"] for a, b in itertools.combinations(chosen, 2)):
+            best = max(best, sum(weights[v] for v in chosen))
+    return best
+
+
+def _gc(p, nums):
+    def done(t):
+        firsts = [t.index(v) for v in set(t)]
+        grouped = all(t[i:i + t.count(v)].count(v) == t.count(v) for v, i in zip(set(t), firsts))
+        return grouped and (p["first"] is None or p["first"] not in t or t[: t.count(p["first"])] == (p["first"],) * t.count(p["first"]))
+
+    start = tuple(nums)
+    dist, frontier = {start: 0}, [start]
+    for t in frontier:  # BFS por trocas adjacentes
+        if done(t):
+            return dist[t]
+        for i in range(len(t) - 1):
+            u = t[:i] + (t[i + 1], t[i]) + t[i + 2 :]
+            if u not in dist:
+                dist[u] = dist[t] + 1
+                frontier.append(u)
+    raise AssertionError("sem estado final")
+
+
+def _sg(p, piles):
+    @lru_cache(None)
+    def win(state):
+        for i, x in enumerate(state):
+            rest = state[:i] + state[i + 1 :]
+            nxt = [rest + (x - s,) for s in p["moves"] if s <= x]
+            nxt += [rest + (a, x - a) for a in range(1, x) if p["split"] == "any" or 2 * a != x]
+            if any(not win(tuple(sorted(y for y in t if y))) for t in nxt):
+                return True
+        return False
+
+    return win(tuple(sorted(y for y in piles if y)))
+
+
+def _ds(p, s, k):
+    bad = (lambda x, y: x == y) if p["rule"] == "equal" else (lambda x, y: abs(ord(x) - ord(y)) == 1)
+    subs = {"".join(c) for c in itertools.combinations(s, k)}
+    return sum(all(not bad(a, b) for a, b in zip(t, t[1:])) for t in subs) % (10**9 + 7)
+
+
 BRUTE = {
-    "k_distinct": (_kd, lambda s: len(s) <= 60),
-    "merge_gap": (_mg, lambda iv: len(iv) <= 12),
     "spiral": (_sp, lambda m: True),
     "step_ways": (_steps, lambda n: n <= 60),
-    "grid_path": (_gp, lambda g: len(g) * len(g[0]) <= 64),
     "brackets": (_br, lambda s: len(s) <= 20),
-    "diff_chain": (_chain, lambda nums: len(nums) <= 12),
-    "knapsack_k": (_knap, lambda w, v, c: len(w) <= 10),
     "grid_passes": (_pass, lambda g: len(g) * len(g[0]) <= 36),
     "intervals_gap": (_wi, lambda iv: len(iv) <= 12),
-    "run_count": (_rc, lambda n: n <= 6),
     "pile_game": (_game, lambda piles: len(piles) <= 3 and max(piles, default=0) <= 15),
+    "digit_count": (_dd, lambda lo, hi: hi <= 6000),
+    "avoid_patterns": (_fp, lambda n: n <= 8),
+    "tree_spread": (_ts, lambda n, e, w: n <= 12),
+    "group_values": (_gc, lambda nums: len(nums) <= 7),
+    "split_game": (_sg, lambda piles: sum(piles) <= 9),
+    "distinct_subseq": (_ds, lambda s, k: len(s) <= 12),
 }
 
 
@@ -245,7 +258,10 @@ class TestCustomBench(unittest.TestCase):
         for p in self.full:
             fam = next(f for f in FAMILIES if f.name == p["family"])
             ns = {fam.fn: lambda *a, _f=fam, _p=p["params"]: _f.solve(_p, *a)}
+            t0 = time.perf_counter()
             exec(p["test_code"], ns)  # não deve levantar
+            # a referência roda com folga no limite do sandbox (10 s), então uma solução polinomial correta cabe
+            self.assertLess(time.perf_counter() - t0, 3.0, p["task_id"])
             ns_bad = {fam.fn: lambda *a: None}
             with self.assertRaises(AssertionError):
                 exec(p["test_code"], ns_bad)
@@ -300,7 +316,7 @@ class TestCustomBench(unittest.TestCase):
         self.assertEqual(res["bench"], "custom_quick")
         self.assertAlmostEqual(res["pass1"], 1 / 18, places=5)
         cfg = res["config"]
-        self.assertEqual(cfg["eval_protocol"], "custom_v1")
+        self.assertEqual(cfg["eval_protocol"], CUSTOM_PROTOCOL_ID)
         self.assertAlmostEqual(cfg["easy_pass1"], round(1 / 6, 4))
         self.assertEqual(cfg["hard_pass1"], 0.0)
         self.assertEqual(cfg["fail_breakdown"], {"truncated": 17})
@@ -323,6 +339,8 @@ class TestCustomBench(unittest.TestCase):
         self.assertEqual(m["tokens_cot_mean_correct"], 100.0)
         self.assertEqual(m["throughput_tok_s"], round(17150 / 5.0, 1))
         self.assertEqual(m["fail_breakdown"], {"truncated": 1, "wrong_answer": 1})
+        self.assertEqual(m["hard_fail_breakdown"], {"truncated": 1, "wrong_answer": 1})
+        self.assertEqual(m["easy_fail_breakdown"], {})
 
 
 if __name__ == "__main__":

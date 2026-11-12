@@ -974,6 +974,7 @@ def eval_custom(
         smoke_n=smoke_n,
         force=force,
         protocol_id=CUSTOM_PROTOCOL_ID,
+        cache_suffix=f"_{CUSTOM_PROTOCOL_ID}",  # cache por problema não mistura versões do benchmark
         extra_config_fn=custom_extra_metrics,
     )
 
