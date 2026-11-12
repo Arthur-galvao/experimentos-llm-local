@@ -926,6 +926,58 @@ def eval_scicode(
     )
 
 
+def eval_custom(
+    model: Any,
+    tokenizer: Any | None = None,
+    *,
+    run_id: str,
+    subset: str = "quick",
+    phase: str = "F0",
+    model_name: str = "dory-4b",
+    checkpoint: str = "base",
+    n_loops: int | None = 2,
+    max_new_tokens: int = 16000,
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+    seed: int = 42,
+    backend: str = "vllm",
+    batch_size: int = 4,
+    cache_dir: str | Path = "eval_cache",
+    results_path: str | Path = DEFAULT_RESULTS_PATH,
+    smoke: bool = False,
+    smoke_n: int = 5,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Benchmark custom (`lib/custom_bench.py`): `subset='quick'` (126 problemas) ou `'full'` (504)."""
+    from .custom_bench import CUSTOM_PROTOCOL_ID, build_custom_suite, custom_extra_metrics
+
+    return _run_problems_loop(
+        problems=build_custom_suite(subset),
+        model=model,
+        tokenizer=tokenizer,
+        run_id=run_id,
+        phase=phase,
+        model_name=model_name,
+        checkpoint=checkpoint,
+        n_loops=n_loops,
+        eval_tier=subset,
+        bench_name=f"custom_{subset}",
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        seed=seed,
+        backend=backend,
+        batch_size=batch_size,
+        cache_dir=cache_dir,
+        results_path=results_path,
+        smoke=smoke,
+        smoke_n=smoke_n,
+        force=force,
+        protocol_id=CUSTOM_PROTOCOL_ID,
+        extra_config_fn=custom_extra_metrics,
+    )
+
+
 def eval_quick(
     model: Any,
     tokenizer: Any | None = None,

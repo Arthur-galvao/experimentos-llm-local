@@ -19,7 +19,7 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
         load_dory_tokenizer,
         verify_tokenizer_equivalence,
     )
-    from lib.evals import eval_gate, eval_quick
+    from lib.evals import eval_custom, eval_gate, eval_quick
     from lib.hw import get_hw_config
     from lib.io import DEFAULT_DRIVE_ROOT, ensure_model_files, setup_drive_and_cache
     from lib.metrics import plot_pareto
@@ -32,73 +32,22 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
     lcb_quick_path = paths["data"] / "lcb_quick.json"
     eval_hw_cfg = get_hw_config("eval")
 
-    if target in ("L1", "L2", "L4"):
-        k_loops = int(target[1:])
-        run_id = f"F0_dory_L{k_loops}"
-        ensure_model_files(DORY_HF_REPO)
-        enforce_tokenizer_report(verify_tokenizer_equivalence(DORY_HF_REPO))
-        tok = load_dory_tokenizer(DORY_HF_REPO)
-
-        if scope in ("quick", "both"):
-            print(f"\n>>> [Subprocesso {target}] Executando eval_quick (vLLM, lotes de 128) para {run_id} (n_loops={k_loops})...")
-            eval_quick(
-                DORY_HF_REPO,
-                tok,
-                run_id=run_id,
-                phase="F0",
-                model_name=DORY_HF_REPO,
-                checkpoint="base",
-                n_loops=k_loops,
-                lcb_quick_path=lcb_quick_path,
-                max_new_tokens=16000,
-                temperature=1.0,
-                top_p=0.95,
-                seed=42,
-                backend="vllm",
-                batch_size=eval_hw_cfg["batch_size"],
-                cache_dir=eval_cache_dir,
-                results_path=results_jsonl,
-                smoke=False,
-            )
-
-        if scope in ("gate", "both"):
-            print(f"\n>>> [Subprocesso {target}] Executando eval_gate (vLLM, lotes de 128) para {run_id} (n_loops={k_loops})...")
-            eval_gate(
-                DORY_HF_REPO,
-                tok,
-                run_id=run_id,
-                phase="F0",
-                model_name=DORY_HF_REPO,
-                checkpoint="base",
-                n_loops=k_loops,
-                max_new_tokens=16000,
-                temperature=1.0,
-                top_p=0.95,
-                seed=42,
-                backend="vllm",
-                batch_size=eval_hw_cfg["batch_size"],
-                cache_dir=eval_cache_dir,
-                results_path=results_jsonl,
-                smoke=False,
-            )
-        print(f"\n=== {run_id}: CONCLUÍDO ===")
-        return
-
-    if target == "qwen":
-        run_id = "F0_qwen3_5_4b"
-        ensure_model_files(QWEN_CONTROL_HF_REPO)
-        tok = load_dory_tokenizer(QWEN_CONTROL_HF_REPO)
-
-        print(f"\n>>> [Subprocesso qwen] Executando eval_quick (vLLM, só texto, lotes de 128) para {QWEN_CONTROL_HF_REPO}...")
-        eval_quick(
-            QWEN_CONTROL_HF_REPO,
-            tok,
+    if target in ("L1", "L2", "L4", "qwen"):
+        if target == "qwen":
+            repo, run_id, k_loops = QWEN_CONTROL_HF_REPO, "F0_qwen3_5_4b", None
+            ensure_model_files(repo)
+        else:
+            repo, k_loops = DORY_HF_REPO, int(target[1:])
+            run_id = f"F0_dory_L{k_loops}"
+            ensure_model_files(repo)
+            enforce_tokenizer_report(verify_tokenizer_equivalence(repo))
+        tok = load_dory_tokenizer(repo)
+        common = dict(
             run_id=run_id,
             phase="F0",
-            model_name=QWEN_CONTROL_HF_REPO,
+            model_name=repo,
             checkpoint="base",
-            n_loops=None,
-            lcb_quick_path=lcb_quick_path,
+            n_loops=k_loops,
             max_new_tokens=16000,
             temperature=1.0,
             top_p=0.95,
@@ -109,6 +58,17 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
             results_path=results_jsonl,
             smoke=False,
         )
+
+        if scope in ("quick", "both"):
+            print(f"\n>>> [Subprocesso {target}] eval_quick (vLLM, lotes de 128) para {run_id} (n_loops={k_loops})...")
+            eval_quick(repo, tok, lcb_quick_path=lcb_quick_path, **common)
+        if scope in ("gate", "both") and target != "qwen":  # Qwen não tem gate
+            print(f"\n>>> [Subprocesso {target}] eval_gate (vLLM, lotes de 128) para {run_id} (n_loops={k_loops})...")
+            eval_gate(repo, tok, **common)
+        if scope.startswith("custom_"):
+            subset = scope.split("_", 1)[1]
+            print(f"\n>>> [Subprocesso {target}] benchmark custom ({subset}) para {run_id} (n_loops={k_loops})...")
+            eval_custom(repo, tok, subset=subset, **common)
         print(f"\n=== {run_id}: CONCLUÍDO ===")
         return
 
@@ -129,7 +89,21 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
                 f"{r['acerto_por_1k_tokens']:12.4f}"
             )
 
-        for bench_name in ("lcb_v6_quick", "humaneval+", "lcb_v6_full", "mbpp+", "scicode"):
+        for r in f0_records:
+            cfg = r.get("config") or {}
+            if str(r.get("bench", "")).startswith("custom_"):
+                tiers = " | ".join(
+                    f"{t}: pass@1 {cfg.get(f'{t}_pass1')} cot {cfg.get(f'{t}_tokens_cot_mean')} "
+                    f"trunc {cfg.get(f'{t}_truncated_frac')}"
+                    for t in ("easy", "medium", "hard")
+                )
+                print(
+                    f"\n{r['run_id']} {r['bench']}: {tiers}\n  cot nos acertos {cfg.get('tokens_cot_mean_correct')}"
+                    f" | {cfg.get('throughput_tok_s')} tok/s | falhas {cfg.get('fail_breakdown')}"
+                    f"\n  por família {cfg.get('family_pass1')}"
+                )
+
+        for bench_name in ("custom_quick", "custom_full", "lcb_v6_quick", "humaneval+", "lcb_v6_full", "mbpp+", "scicode"):
             bench_rows = [r for r in f0_records if r.get("bench") == bench_name]
             if not bench_rows:
                 continue
@@ -170,9 +144,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--scope",
-        choices=("quick", "gate", "both"),
-        default="quick",
-        help="Dory: 'quick' (HE+ + LCB quick, padrão), 'gate' (HE+, MBPP+, LCB full/Pro, SciCode) ou 'both'. Qwen só tem quick.",
+        choices=("custom_quick", "custom_full", "quick", "gate", "both"),
+        default="custom_quick",
+        help=(
+            "'custom_quick' (126 problemas custom, padrão) ou 'custom_full' (504); benchmarks públicos: "
+            "'quick' (HE+ + LCB quick), 'gate' (HE+, MBPP+, LCB full/Pro, SciCode; Qwen não tem) ou 'both'."
+        ),
     )
     parser.add_argument("positional_target", nargs="?", default=None)
     args = parser.parse_args()

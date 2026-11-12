@@ -102,16 +102,19 @@ Um LLM traduzindo um log comprimido gera uma explicação plausível, mas não f
 
 ## 7. Avaliação
 
-### Benchmarks
+**Durante o desenvolvimento, toda comparação entre fases usa só o benchmark custom** ([BENCH_CUSTOM.md](BENCH_CUSTOM.md)): problemas de código gerados por semente, com modo rápido de 126 e completo de 504, medindo acerto, tokens, truncamento, tempo e motivo das falhas. Os benchmarks públicos abaixo ficam para a demonstração final.
+
+### Benchmarks (demonstração final)
 - **HumanEval+ / MBPP+ (EvalPlus):** filtro rápido, roda em minutos.
 - **LiveCodeBench v6:** métrica principal. Usar os problemas mais recentes para evitar contaminação. Subconjunto fixo de ~200 para iterar, completo no fim de cada fase.
 - **LiveCodeBench Pro:** difícil e com ruído alto. Só no fim de fase.
 - **SciCode:** alarme de perda de conhecimento (exige conhecimento científico, não só código).
 
 ### Fluxo
-- **A cada experimento:** HumanEval+ + subconjunto LCB v6, registrando acerto, tokens de CoT, tokens totais e latência.
-- **No fim de cada fase:** LCB v6 completo + LCB Pro + SciCode, contra o baseline reproduzido.
-- **Critério de corte:** a fase só fica se melhorar a curva acerto × tokens **e** o SciCode não cair mais que 2 pontos. Se não passar, a fase é descartada e o projeto segue da melhor versão anterior.
+- **A cada experimento:** `custom_quick`.
+- **No fim de cada fase:** `custom_full`, contra o baseline reproduzido nos mesmos problemas.
+- **Critério de corte:** a fase só fica se melhorar a curva acerto × tokens no `custom_full` sem perder acerto em nenhum nível (easy/medium/hard). Se não passar, a fase é descartada e o projeto segue da melhor versão anterior.
+- **Demonstração final:** os benchmarks públicos acima, contra os números de [RESULTADOS_F0.md](RESULTADOS_F0.md).
 
 ### Baseline
 Os números dos model cards são vendor-reported. Reproduzimos o Dory (1, 2 e 4 loops) e o Qwen3.5-4B na nossa configuração, e **esses** passam a ser os números de referência.
