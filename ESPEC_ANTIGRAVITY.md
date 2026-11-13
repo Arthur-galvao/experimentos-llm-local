@@ -152,6 +152,13 @@ O notebook de gate imprime `PASSOU` ou `REPROVOU` com os números. Se reprovar, 
 
 **Saída:** `data/short_cot_sft.jsonl` + estatísticas (redução média de tokens em relação à média das amostras).
 
+**Como foi implementado** (`scripts/f1a_self_distill.py`, notebook `F1a_self_distill.ipynb`):
+- **Dataset:** `agentica-org/DeepCoder-Preview-Dataset`, config `taco` (TACO-verified filtrado, MIT, enunciados humanos, >= 5 testes). Ficam de fora o KodCode (gerado pelo GPT-4o), o `primeintellect` (sintético) e o `lcbv5` (são problemas do LCB v6). Só problemas stdin/stdout: os funcionais do TACO não trazem a assinatura no enunciado.
+- **Dedup:** 13-gramas de palavras contra LCB v6, HumanEval+, MBPP+ e o custom; sai o problema que divide >= 30% dos 13-gramas com algum problema de benchmark.
+- **Amostragem:** a oficial do Dory (temperatura 1.0, top_p 0.95), no lugar dos ~0.7, igual à da avaliação e à dos rollouts da F1c. Orçamento de 16384 tokens; amostra truncada conta como erro. Prompt e sandbox iguais aos do LCB (6 s por teste).
+- **Guarda todas as amostras**, inclusive as erradas, com tipo do erro e teste que falhou: são os ramos mortos e os casos de borda do SFT arbóreo (`CONCEITO_RACIOCINIO_ARBOREO.md`, seção 8.1). O p̂ de cada problema (acertos / 8) separa direto de armadilha para o currículo e para o bônus (1 − p̂)² da F1c.
+- **CoT vazia:** vai para os problemas com p̂ = 1 de menor CoT, até 20% dos exemplos.
+
 #### F1b: SFT (`F1b_sft_short_cot.ipynb`)
 - SFT do Dory em `short_cot_sft.jsonl`, com a config do perfil de hardware.
 - Treinar com o número de loops padrão (2). Avaliar com 1/2/4.
