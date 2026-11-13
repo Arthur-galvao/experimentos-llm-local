@@ -284,6 +284,7 @@ def _run_problems_loop(
     protocol_id: str | None = None,
     cache_suffix: str = "",
     extra_config_fn: Any | None = None,
+    reuse_cache: tuple[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generic resumable evaluation loop over standardized problem dicts.
 
@@ -296,12 +297,15 @@ def _run_problems_loop(
     `protocol_id` marca o protocolo de avaliação no config e impede reaproveitar resultados antigos
     (de um protocolo diferente) em `results.jsonl`; `cache_suffix` separa o cache por problema;
     `extra_config_fn({task_id: registro}) -> dict` acrescenta métricas ao config final.
+    `reuse_cache=(sufixo_antigo, task_id -> task_id antigo ou None)` copia para o cache novo as linhas do
+    cache de outro protocolo cuja geração continua valendo, sem gerar de novo.
     """
     effective_tier = "smoke" if smoke else eval_tier
     allow_hf_fallback = bool(smoke)
     # Amostragem fora da do Dory (Qwen: top_k/presence) entra no protocolo e no cache: resultado e gerações
     # antigas da Qwen, feitas sem elas, não são reaproveitados.
     samp = official_sampling(model_name)
+    tag = ""
     if samp["top_k"] or samp["presence_penalty"]:
         tag = f"_k{samp['top_k']}_pp{samp['presence_penalty']}"
         cache_suffix += tag
@@ -332,6 +336,14 @@ def _run_problems_loop(
 
     cache_file = Path(cache_dir) / f"{run_id}_{bench_name}_{effective_tier}{cache_suffix}.jsonl"
     progress = ResumableProgress(cache_file)
+    if reuse_cache is not None:  # gerações de outra versão do protocolo que continuam válidas
+        old_suffix, old_id_of = reuse_cache
+        old = ResumableProgress(Path(cache_dir) / f"{run_id}_{bench_name}_{effective_tier}{old_suffix}{tag}.jsonl")
+        for p in active_problems:
+            tid, oid = str(p["task_id"]), old_id_of(str(p["task_id"]))
+            if oid is not None and not progress.is_done(tid) and old.is_done(oid):
+                row = {k: v for k, v in old.get(oid).items() if k != "item_id"}
+                progress.record(tid, {**row, "reused_from": f"{old_suffix.lstrip('_')}:{oid}"})
 
     pending = [p for p in active_problems if not progress.is_done(str(p["task_id"]))]
     if pending:
@@ -966,7 +978,14 @@ def eval_custom(
 ) -> dict[str, Any]:
     """Benchmark custom (`lib/custom_bench.py`): `subset='quick'` (126 problemas) ou `'full'` (504).
     `max_new_tokens=None` usa o orçamento do protocolo (`CUSTOM_MAX_NEW_TOKENS`)."""
-    from .custom_bench import CUSTOM_MAX_NEW_TOKENS, CUSTOM_PROTOCOL_ID, build_custom_suite, custom_extra_metrics
+    from .custom_bench import (
+        CUSTOM_MAX_NEW_TOKENS,
+        CUSTOM_PROTOCOL_ID,
+        REUSE_CACHE_FROM,
+        build_custom_suite,
+        custom_extra_metrics,
+        reused_task_id,
+    )
 
     budget = CUSTOM_MAX_NEW_TOKENS if max_new_tokens is None else int(max_new_tokens)
     return _run_problems_loop(
@@ -994,6 +1013,8 @@ def eval_custom(
         protocol_id=CUSTOM_PROTOCOL_ID,
         cache_suffix=f"_{CUSTOM_PROTOCOL_ID}",  # cache por problema não mistura versões do benchmark
         extra_config_fn=lambda rows: custom_extra_metrics(rows, max_new_tokens=budget),
+        # só com o orçamento do protocolo: a v3 gerou com ele
+        reuse_cache=(f"_{REUSE_CACHE_FROM}", reused_task_id) if budget == CUSTOM_MAX_NEW_TOKENS else None,
     )
 
 

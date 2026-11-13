@@ -5,9 +5,9 @@ a semântica do problema (não só nomes), e os testes vêm da solução de refe
 família de medium/hard tem uma força bruta independente em `tests/test_custom_bench.py` que confere a
 referência. Determinístico: mesma semente => mesmos problemas; `quick` é um prefixo de `full`.
 
-Níveis (desde a custom_v2): easy = Dory acerta tudo (mede pensar demais no simples); medium = Dory acerta
-a maioria e separa os loops; hard = técnicas não óbvias onde o Dory acerta pouco, para separar ganho de
-raciocínio de ganho só de tokens.
+Níveis (desde a custom_v4): easy = Dory acerta tudo (mede pensar demais no simples); medium = técnica
+conhecida mas longa, o acerto depende do orçamento (mede economia de tokens); hard = é preciso achar o
+modelo certo do problema e o Dory acerta pouco, para separar ganho de raciocínio de ganho só de tokens.
 
 Mede, por problema: acerto (testes escondidos), tokens de CoT/total, truncamento e latência; o
 `custom_extra_metrics` agrega por nível, por família e por tipo de falha.
@@ -29,7 +29,17 @@ from .metrics import LOOP_SCORE_THRESHOLD
 
 # Mude ao alterar qualquer família ou o protocolo de geração: invalida resultados antigos.
 # v3 = mesmas instâncias da v2, com orçamento de CUSTOM_MAX_NEW_TOKENS e amostragem oficial de cada modelo.
-CUSTOM_PROTOCOL_ID = "custom_v3"
+# v4 = hard da v3 vira medium, 6 hard novas, o medium da v3 sai.
+CUSTOM_PROTOCOL_ID = "custom_v4"
+# O easy e o medium da v4 são as mesmas instâncias da v3 (a semente não depende do nível), geradas com o
+# mesmo orçamento e amostragem: o cache da v3 vale para eles, e só o hard novo precisa gerar.
+REUSE_CACHE_FROM = "custom_v3"
+
+
+def reused_task_id(task_id: str) -> str | None:
+    """task_id da v3 com a mesma geração que este task_id da v4 (None = problema novo)."""
+    tier, rest = task_id.split("/", 1)
+    return {"easy": task_id, "medium": f"hard/{rest}"}.get(tier)
 CUSTOM_SEED = "coder-comprimido-custom-v1"
 # Orçamento grande para o truncamento não decidir o acerto: 81.920 é o que a Qwen recomenda para
 # programação de competição (o Dory aceita até 256K). Os cortes menores saem da mesma rodada (BUDGETS).
@@ -230,278 +240,12 @@ def _sort_solve(p, words):
 # --------------------------------------------------------------------------------------- medium
 
 
-_DIR_NAMES = ["right", "down", "left", "up"]
-_DIRS = [(0, 1), (1, 0), (0, -1), (-1, 0)]
-_SPIRAL_START = {  # (canto, rotação) -> direção inicial, sempre ao longo da borda
-    ("top-left", "clockwise"): "right",
-    ("top-right", "clockwise"): "down",
-    ("bottom-right", "clockwise"): "left",
-    ("bottom-left", "clockwise"): "up",
-    ("top-left", "counterclockwise"): "down",
-    ("top-right", "counterclockwise"): "left",
-    ("bottom-right", "counterclockwise"): "up",
-    ("bottom-left", "counterclockwise"): "right",
-}
-
-
-def _sp_params(rng):
-    corner, rot = rng.choice(sorted(_SPIRAL_START))
-    return {"corner": corner, "rot": rot, "facing": _SPIRAL_START[(corner, rot)]}
-
-
-def _sp_desc(p):
-    return (
-        "Traverse `matrix` (a non-empty rectangular grid of integers; row 0 is the top row, column 0 the "
-        "left column) in a spiral and return the list of visited values in order. Start at the "
-        f"{p['corner']} cell, facing {p['facing']}. Repeatedly: record the value of the current cell; if "
-        "every cell has been recorded, stop; otherwise, if the next cell in the facing direction is inside "
-        f"the grid and not yet recorded, move to it, else turn 90 degrees {p['rot']} and move one cell in "
-        "the new direction.\n\nConstraints: 1 <= number of rows, number of columns <= 8."
-    )
-
-
-def _sp_inputs(rng, p):
-    def mat(r, c):
-        vals = rng.sample(range(1, 100), r * c)
-        return [vals[i * c : (i + 1) * c] for i in range(r)]
-
-    out = [(mat(3, 3),), (mat(3, 4),), ([[7]],), (mat(1, 5),), (mat(5, 1),), (mat(2, 2),)]
-    return out + [(mat(rng.randint(1, 8), rng.randint(1, 8)),) for _ in range(8)]
-
-
-def _sp_solve(p, matrix):
-    rows, cols = len(matrix), len(matrix[0])
-    r = 0 if p["corner"].startswith("top") else rows - 1
-    c = 0 if p["corner"].endswith("left") else cols - 1
-    d = _DIR_NAMES.index(p["facing"])
-    turn = 1 if p["rot"] == "clockwise" else -1
-    inside = lambda rr, cc: 0 <= rr < rows and 0 <= cc < cols and (rr, cc) not in seen  # noqa: E731
-    seen: set[tuple[int, int]] = set()
-    out = []
-    while True:
-        seen.add((r, c))
-        out.append(matrix[r][c])
-        if len(seen) == rows * cols:
-            return out
-        if not inside(r + _DIRS[d][0], c + _DIRS[d][1]):
-            d = (d + turn) % 4
-            if not inside(r + _DIRS[d][0], c + _DIRS[d][1]):
-                raise AssertionError("spiral: a curva leva a uma célula inválida (enunciado ambíguo)")
-        r, c = r + _DIRS[d][0], c + _DIRS[d][1]
-
-_MODS = [10**9 + 7, 998244353, 10**9 + 9, 1000003]
-
-
-def _steps_params(rng):
-    return {"steps": sorted(rng.sample(range(1, 8), rng.randint(2, 4))), "mod": rng.choice(_MODS)}
-
-
-def _steps_desc(p):
-    return (
-        f"You climb a staircase of `n` steps; each move climbs exactly s steps for some s in {p['steps']}. "
-        "Return the number of different ordered sequences of moves that end exactly on step n, modulo "
-        f"{p['mod']}. For n = 0 the answer is 1 (the empty sequence).\n\nConstraints: 0 <= n <= 100000."
-    )
-
-
-def _steps_inputs(rng, p):
-    out = [(rng.randint(5, 9),), (rng.randint(10, 14),), (0,), (1,), (p["steps"][0] - 1,)]
-    out += [(rng.randint(0, 60),) for _ in range(7)]
-    return out + [(100000,), (99991,)]
-
-
-def _steps_solve(p, n):
-    dp = [0] * (n + 1)
-    dp[0] = 1
-    for i in range(1, n + 1):
-        dp[i] = sum(dp[i - s] for s in p["steps"] if s <= i) % p["mod"]
-    return dp[n]
-
-_BRACKETS = ["()", "()[]", "()[]{}"]
-
-
-def _br_params(rng):
-    return {"pairs": rng.choice(_BRACKETS)}
-
-
-def _br_desc(p):
-    pairs = [p["pairs"][i : i + 2] for i in range(0, len(p["pairs"]), 2)]
-    return (
-        "A string is balanced if it can be reduced to the empty string by repeatedly deleting an adjacent "
-        f"matched pair {', '.join(repr(x) for x in pairs)}. Return the length of the longest contiguous "
-        "substring of `s` that is balanced (0 if none; the empty substring counts as balanced).\n\n"
-        f"Constraints: 0 <= len(s) <= 3000; `s` uses only the characters {p['pairs']!r}."
-    )
-
-
-def _br_balanced(rng, pairs, n_pairs):
-    opens, closes = pairs[0::2], pairs[1::2]
-    s, stack, left = [], [], n_pairs
-    while left or stack:
-        if left and (not stack or rng.random() < 0.5):
-            i = rng.randrange(len(opens))
-            s.append(opens[i])
-            stack.append(closes[i])
-            left -= 1
-        else:
-            s.append(stack.pop())
-    return "".join(s)
-
-
-def _br_str(rng, pairs, length):
-    parts, total = [], 0
-    while total < length:
-        chunk = _br_balanced(rng, pairs, rng.randint(1, 4)) if rng.random() < 0.6 else rng.choice(pairs)
-        parts.append(chunk)
-        total += len(chunk)
-    return "".join(parts)[:length]
-
-
-def _br_inputs(rng, p):
-    pr = p["pairs"]
-    out = [(_br_str(rng, pr, rng.randint(8, 12)),), (_br_str(rng, pr, rng.randint(12, 16)),), ("",)]
-    out += [(pr[1] + pr[0],), (pr[:2] * 3,)]
-    out += [(_br_str(rng, pr, rng.randint(1, 20)),) for _ in range(8)]
-    return out + [(_br_str(rng, pr, 3000),), (_br_str(rng, pr, 3000),)]
-
-
-def _br_solve(p, s):
-    match = {p["pairs"][i + 1]: p["pairs"][i] for i in range(0, len(p["pairs"]), 2)}
-    stack, best = [-1], 0  # índices: aberturas pendentes ou barreiras
-    for i, ch in enumerate(s):
-        if ch in match and len(stack) > 1 and s[stack[-1]] == match[ch]:
-            stack.pop()
-            best = max(best, i - stack[-1])
-        else:
-            stack.append(i)
-    return best
-
-def _pass_params(rng):
-    return {"K": rng.randint(0, 3)}
-
-
-def _pass_desc(p):
-    return (
-        "`grid` is a rectangular grid of integers from 1 to 9. Walk from the top-left cell to the "
-        "bottom-right cell, moving each step to a side-adjacent cell (up, down, left or right). Every time "
-        "you are on a cell you pay its value: you pay for the start cell, and again each time you enter a "
-        f"cell. You hold {p['K']} free passes; each pass makes one of those payments 0. Return the minimum "
-        "total payment.\n\nConstraints: 1 <= number of rows, number of columns <= 25."
-    )
-
-
-def _pass_inputs(rng, p):
-    g = lambda r, c: [[rng.randint(1, 9) for _ in range(c)] for _ in range(r)]  # noqa: E731
-    out = [(g(3, 3),), (g(3, 4),), ([[5]],), (g(1, 6),), (g(4, 1),)]
-    out += [(g(rng.randint(1, 6), rng.randint(1, 6)),) for _ in range(7)]
-    return out + [(g(25, 25),), (g(25, 20),)]
-
-
-def _pass_solve(p, grid):
-    rows, cols, K = len(grid), len(grid[0]), p["K"]
-    dist = {(0, 0, 0): grid[0][0]}
-    heap = [(grid[0][0], 0, 0, 0)]
-    if K:
-        dist[(0, 0, 1)] = 0
-        heap.append((0, 0, 0, 1))
-    heapq.heapify(heap)
-    while heap:
-        d, r, c, k = heapq.heappop(heap)
-        if d > dist[(r, c, k)]:
-            continue
-        if (r, c) == (rows - 1, cols - 1):
-            return d
-        for dr, dc in _DIRS:
-            nr, nc = r + dr, c + dc
-            if not (0 <= nr < rows and 0 <= nc < cols):
-                continue
-            for nk, nd in ((k, d + grid[nr][nc]), (k + 1, d)):
-                if nk <= K and nd < dist.get((nr, nc, nk), float("inf")):
-                    dist[(nr, nc, nk)] = nd
-                    heapq.heappush(heap, (nd, nr, nc, nk))
-    raise AssertionError("inalcançável")
-
-
-def _wi_params(rng):
-    return {"g": rng.randint(0, 3)}
-
-
-def _wi_desc(p):
-    return (
-        "Each element of `intervals` is [start, end, weight] with start < end. Choose a set of intervals "
-        f"such that for any two chosen intervals A and B, either B.start - A.end >= {p['g']} or "
-        f"A.start - B.end >= {p['g']}. Return the maximum possible total weight of the chosen intervals "
-        "(0 for an empty list).\n\nConstraints: 0 <= len(intervals) <= 1000, 0 <= start < end <= 10**6, "
-        "1 <= weight <= 1000."
-    )
-
-
-def _wi_inputs(rng, p):
-    def ivs(n, hi, maxlen, wmax):
-        out = []
-        for _ in range(n):
-            s = rng.randint(0, hi - 1)
-            out.append([s, min(hi, s + rng.randint(1, maxlen)), rng.randint(1, wmax)])
-        return out
-
-    out = [(ivs(4, 20, 6, 20),), (ivs(6, 25, 6, 20),), ([],), ([[0, 2, 5], [2, 4, 7]],)]
-    out += [(ivs(rng.randint(1, 12), 30, 8, 20),) for _ in range(8)]
-    return out + [(ivs(1000, 10**6, 5000, 1000),), (ivs(1000, 10**5, 2000, 1000),)]
-
-
-def _wi_solve(p, intervals):
-    iv = sorted((e, s, w) for s, e, w in intervals)
-    ends = [e for e, _, _ in iv]
-    dp = [0] * (len(iv) + 1)
-    for i, (e, s, w) in enumerate(iv, 1):
-        j = bisect.bisect_right(ends, s - p["g"], 0, i - 1)
-        dp[i] = max(dp[i - 1], dp[j] + w)
-    return dp[-1]
-
-
-def _game_params(rng):
-    return {"moves": sorted(rng.sample(range(1, 10), rng.randint(2, 4)))}
-
-
-def _game_desc(p):
-    return (
-        "Two players alternate turns on the piles of stones in `piles`. On a turn the player chooses one pile "
-        f"and removes exactly s stones from it, for some s in {p['moves']} with s <= the size of that pile. "
-        "The player who cannot make a move loses. Both play optimally. Return True if the player who moves "
-        "first wins, otherwise False.\n\nConstraints: 1 <= len(piles) <= 5, 0 <= piles[i] <= 10000."
-    )
-
-
-def _game_inputs(rng, p):
-    rnd = lambda n, v: [rng.randint(0, v) for _ in range(n)]  # noqa: E731
-    out = [(rnd(2, 15),), (rnd(3, 15),), ([0],), ([0, 0],), ([p["moves"][0]],)]
-    out += [(rnd(rng.randint(1, 3), 12),) for _ in range(8)]
-    return out + [(rnd(5, 10000),), (rnd(4, 10000),)]
-
-
-def _game_solve(p, piles):
-    top = max(piles, default=0)
-    gr = [0] * (top + 1)
-    for x in range(1, top + 1):
-        seen = {gr[x - s] for s in p["moves"] if s <= x}
-        g = 0
-        while g in seen:
-            g += 1
-        gr[x] = g
-    acc = 0
-    for x in piles:
-        acc ^= gr[x]
-    return acc != 0
-
-
-# ----------------------------------------------------------------------------------------- hard
-
-
 _MOD = 10**9 + 7
 
-# Nível hard: técnica não óbvia (DP de dígitos, autômato + potência de matriz, DP em árvore com
-# distância, DP em bitmask sobre custos de inversão, Sprague-Grundy com divisão, autômato de
-# subsequências) + entradas grandes que reprovam força bruta. Alvo: Dory acerta pouco.
+# Nível medium (era o hard da v2/v3): técnica conhecida mas longa (DP de dígitos, autômato + potência de
+# matriz, DP em árvore com distância, DP em bitmask sobre custos de inversão, Sprague-Grundy com divisão,
+# autômato de subsequências) + entradas grandes que reprovam força bruta. Na v3 o L2 acertou 83%, com
+# acerto que sobe muito de 16k para 32k tokens: mede economia de tokens.
 
 
 def _dd_params(rng):
@@ -812,6 +556,471 @@ def _ds_solve(p, s, k):
     return sum(f[j] for j in nxt[0].values()) % _MOD
 
 
+
+# ----------------------------------------------------------------------------------------- hard
+
+# Nível hard (desde a custom_v4): o truque não é uma DP conhecida, é perceber o modelo certo do problema
+# (corte mínimo, fluxo de custo mínimo, slope trick, análise retrógrada com empate, Burnside, árvore de
+# segmentos sobre max - min). Entradas grandes reprovam força bruta. Alvo: Dory acerta de 10% a 25%.
+
+
+def _maxflow(graph, s, t):
+    """Dinic. graph[u] = lista de [v, cap, índice da aresta reversa em graph[v]]."""
+    total = 0
+    while True:
+        level = [-1] * len(graph)
+        level[s] = 0
+        queue = [s]
+        for u in queue:
+            for v, cap, _ in graph[u]:
+                if cap > 0 and level[v] < 0:
+                    level[v] = level[u] + 1
+                    queue.append(v)
+        if level[t] < 0:
+            return total
+        it = [0] * len(graph)
+        while True:  # caminhos aumentantes no grafo de níveis, sem recursão
+            path, u = [], s
+            while u != t:
+                while it[u] < len(graph[u]):
+                    v, cap, _ = graph[u][it[u]]
+                    if cap > 0 and level[v] == level[u] + 1:
+                        break
+                    it[u] += 1
+                if it[u] < len(graph[u]):
+                    path.append(u)
+                    u = graph[u][it[u]][0]
+                elif u == s:
+                    break
+                else:
+                    level[u] = -1  # beco sem saída
+                    u = path.pop()
+                    it[u] += 1
+            if u != t:
+                break
+            f = min(graph[x][it[x]][1] for x in path)
+            for x in path:
+                e = graph[x][it[x]]
+                e[1] -= f
+                graph[e[0]][e[2]][1] += f
+            total += f
+
+
+def _seg_params(rng):
+    return {"P": rng.randint(2, 15), "nbr": rng.choice([4, 8]), "border0": rng.random() < 0.4}
+
+
+def _seg_desc(p):
+    nb = "share a side" if p["nbr"] == 4 else "share a side or a corner"
+    border = (
+        " Every cell in the first or last row or in the first or last column must get the label 0."
+        if p["border0"]
+        else ""
+    )
+    return (
+        "`cost0` and `cost1` are R x C grids of non-negative integers. Give every cell (r, c) the label 0 "
+        "or the label 1: label 0 costs cost0[r][c] and label 1 costs cost1[r][c]. In addition, every pair "
+        f"of neighbouring cells that get different labels costs {p['P']}. Two cells are neighbours if they "
+        f"{nb}.{border} Return the minimum possible total cost.\n\n"
+        "Constraints: 1 <= R, C <= 25, 0 <= cost0[r][c], cost1[r][c] <= 100."
+    )
+
+
+def _seg_inputs(rng, p):
+    def grid(r, c, hi):
+        return ([[rng.randint(0, hi) for _ in range(c)] for _ in range(r)],
+                [[rng.randint(0, hi) for _ in range(c)] for _ in range(r)])
+
+    out = [grid(2, 3, 20), grid(3, 3, 20), grid(1, 1, 20), grid(1, 5, 20), grid(4, 1, 20)]
+    out += [([[7, 7], [7, 7]], [[7, 7], [7, 7]])]
+    out += [grid(*rng.choice([(3, 4), (2, 6), (4, 3), (2, 5), (3, 3)]), 25) for _ in range(6)]
+    return out + [grid(25, 25, 100), grid(20, 25, 100)]
+
+
+def _seg_solve(p, cost0, cost1):
+    R, C = len(cost0), len(cost0[0])
+    s, t, big = R * C, R * C + 1, 10**9
+    graph: list[list[list[int]]] = [[] for _ in range(R * C + 2)]
+
+    def add(u, v, cap_uv, cap_vu=0):
+        graph[u].append([v, cap_uv, len(graph[v])])
+        graph[v].append([u, cap_vu, len(graph[u]) - 1])
+
+    steps = [(0, 1), (1, 0)] + ([(1, 1), (1, -1)] if p["nbr"] == 8 else [])
+    for r in range(R):
+        for c in range(C):
+            v = r * C + c
+            forced = p["border0"] and (r in (0, R - 1) or c in (0, C - 1))
+            add(s, v, big if forced else cost1[r][c])  # cortada se v fica do lado do sorvedouro (rótulo 1)
+            add(v, t, cost0[r][c])  # cortada se v fica do lado da fonte (rótulo 0)
+            for dr, dc in steps:
+                if 0 <= r + dr < R and 0 <= c + dc < C:
+                    add(v, (r + dr) * C + c + dc, p["P"], p["P"])
+    return _maxflow(graph, s, t)
+
+
+def _wm_params(rng):
+    return {"D": rng.choice([0, 0, 1, 2, 5]), "dir": rng.choice(["inc", "dec"])}
+
+
+def _wm_desc(p):
+    if p["dir"] == "inc":
+        rule = "b is non-decreasing" if p["D"] == 0 else f"b[i+1] >= b[i] + {p['D']} for every i"
+    else:
+        rule = "b is non-increasing" if p["D"] == 0 else f"b[i+1] <= b[i] - {p['D']} for every i"
+    return (
+        "Given `a` and `w` of the same length n, choose an integer array b of length n such that "
+        f"{rule}. The cost of b is the sum of w[i] * abs(b[i] - a[i]). Return the minimum possible cost.\n\n"
+        "Constraints: 0 <= n <= 3 * 10**4, -10**9 <= a[i] <= 10**9, 1 <= w[i] <= 1000."
+    )
+
+
+def _wm_inputs(rng, p):
+    def arr(n, hi, wmax):
+        return ([rng.randint(-hi, hi) for _ in range(n)], [rng.randint(1, wmax) for _ in range(n)])
+
+    out = [arr(5, 20, 9), arr(6, 20, 9), ([], []), ([5], [3]), ([1, 2, 3, 4], [1, 1, 1, 1])]
+    out += [([4, 3, 2, 1], [2, 1, 3, 1])]
+    out += [arr(rng.randint(2, 7), rng.choice([5, 30]), rng.choice([1, 10])) for _ in range(6)]
+    n = 3 * 10**4  # O(n^2) fica inviável sem estourar o tamanho do test_code (10**5 dava 3 MB, ~350 MB de pico)
+    return out + [arr(n, 10**9, 1000), ([10**9 - 50 - 7 * i + rng.randint(0, 50) for i in range(n)],
+                                        [rng.randint(1, 1000) for _ in range(n)])]
+
+
+def _wm_solve(p, a, w):
+    if p["dir"] == "dec":  # b[i+1] <= b[i] - D é a condição crescente lida de trás para frente
+        a, w = a[::-1], w[::-1]
+    heap: list[tuple[int, int]] = []  # slope trick: (-ponto de quebra, peso)
+    ans = 0
+    for i, (x, wi) in enumerate(zip(a, w)):
+        c = x - i * p["D"]  # com b'[i] = b[i] - i*D a condição vira b' não decrescente
+        heapq.heappush(heap, (-c, 2 * wi))
+        need = wi
+        while need:
+            nv, cnt = heap[0]
+            take = min(cnt, need)
+            ans += (-nv - c) * take
+            need -= take
+            if take == cnt:
+                heapq.heappop(heap)
+            else:
+                heapq.heapreplace(heap, (nv, cnt - take))
+    return ans
+
+
+def _cg_params(rng):
+    return {"first": rng.choice(["runner", "chaser"]), "stay": rng.random() < 0.5}
+
+
+def _cg_desc(p):
+    move = (
+        "either keep its token where it is or move it along one outgoing edge"
+        if p["stay"]
+        else "move its token along one outgoing edge"
+    )
+    return (
+        "A directed graph has nodes 0 to n-1 and the directed edges [u, v] (from u to v) in `edges`. A runner "
+        "token starts on node `runner` and a chaser token on node `chaser` (different nodes, neither in "
+        f"`targets`). The two players alternate turns and the {p['first']} moves first. On its turn a player "
+        f"must {move} of the node its token is on. The chaser may never move onto a node in `targets`. A "
+        "player with no allowed move on its turn loses. The chaser wins as soon as both tokens are on the "
+        "same node. The runner wins as soon as its token is on a node in `targets`. If the game can go on "
+        "forever, it is a draw. Both play optimally (a player who cannot win prefers a draw to losing). "
+        "Return 'runner', 'chaser' or 'draw'.\n\n"
+        "Constraints: 2 <= n <= 60, 0 <= len(edges) <= 200, no self-loops or repeated edges."
+    )
+
+
+def _cg_graph(rng, n, maxdeg):
+    edges = [[u, v] for u in range(n) for v in rng.sample([x for x in range(n) if x != u], rng.randint(0, min(maxdeg, n - 1)))]
+    rng.shuffle(edges)
+    nodes = list(range(n))
+    rng.shuffle(nodes)
+    targets = sorted(nodes[: rng.randint(1, min(2, n - 2))])
+    return (n, edges, targets, nodes[-1], nodes[-2])
+
+
+def _cg_inputs(rng, p):
+    out = [_cg_graph(rng, 5, 2), _cg_graph(rng, 6, 2), (3, [], [2], 0, 1)]
+    out += [(3, [[0, 2], [1, 0]], [2], 0, 1), (4, [[0, 1], [1, 0], [2, 3], [3, 2]], [3], 0, 2)]
+    out += [_cg_graph(rng, rng.randint(3, 8), rng.choice([1, 2, 3])) for _ in range(7)]
+    return out + [_cg_graph(rng, 60, 3), _cg_graph(rng, 60, 2)]
+
+
+def _cg_solve(p, n, edges, targets, runner, chaser):
+    T = set(targets)
+    out_r = [[v] if p["stay"] else [] for v in range(n)]
+    for u, v in edges:
+        out_r[u].append(v)
+    out_c = [[v for v in out_r[u] if v not in T] for u in range(n)]
+    in_r = [[] for _ in range(n)]  # quem chega em v num lance do runner (idem chaser)
+    in_c = [[] for _ in range(n)]
+    for u in range(n):
+        for v in out_r[u]:
+            in_r[v].append(u)
+        for v in out_c[u]:
+            in_c[v].append(u)
+    # estado (r, c, vez): vez 0 = runner joga, 1 = chaser joga; valor = quem vence (análise retrógrada)
+    res: dict[tuple[int, int, int], str] = {}
+    left: dict[tuple[int, int, int], int] = {}
+    queue = []
+    for r in range(n):
+        for c in range(n):
+            for turn in (0, 1):
+                st = (r, c, turn)
+                if r == c:
+                    res[st] = "chaser"
+                elif r in T:
+                    res[st] = "runner"
+                else:
+                    left[st] = len(out_r[r]) if turn == 0 else len(out_c[c])
+                    if left[st] == 0:
+                        res[st] = "chaser" if turn == 0 else "runner"
+                    else:
+                        continue
+                queue.append(st)
+    for r, c, turn in queue:
+        winner = res[(r, c, turn)]
+        preds = [(x, c, 0) for x in in_r[r]] if turn == 1 else [(r, x, 1) for x in in_c[c]]
+        for pr in preds:
+            if pr in res:
+                continue
+            mover = "runner" if pr[2] == 0 else "chaser"
+            if winner == mover:
+                res[pr] = mover
+                queue.append(pr)
+            else:
+                left[pr] -= 1
+                if left[pr] == 0:
+                    res[pr] = winner
+                    queue.append(pr)
+    return res.get((runner, chaser, 0 if p["first"] == "runner" else 1), "draw")
+
+
+def _rg_params(rng):
+    return {"flip": rng.random() < 0.5}
+
+
+def _rg_desc(p):
+    same = "rotating the ring or turning it over" if p["flip"] else "rotating the ring (turning it over is not allowed)"
+    return (
+        "A ring has n beads, bead i next to bead i+1 and bead n-1 next to bead 0. Each bead is painted with "
+        "one of c colors so that no two neighbouring beads have the same color. Two paintings are the same "
+        f"ring if one can be obtained from the other by {same}. Return the number of different rings "
+        "modulo 1000000007.\n\nConstraints: 3 <= n <= 10**9, 1 <= c <= 10**9."
+    )
+
+
+def _rg_inputs(rng, p):
+    small = [(n, c) for n in range(3, 8) for c in range(1, 5) if c**n <= 5000]
+    out = [(4, 3), (5, 3), (3, 1), (4, 2), (6, 2)]
+    out += rng.sample(small, 6)
+    return out + [(10**9, 10**9), (720720, rng.randint(2, 10**9)), (999999937, rng.randint(2, 50)),
+                  (2**29, 3)]
+
+
+def _rg_solve(p, n, c):
+    fac: dict[int, int] = {}
+    m, d = n, 2
+    while d * d <= m:
+        while m % d == 0:
+            fac[d] = fac.get(d, 0) + 1
+            m //= d
+        d += 1
+    if m > 1:
+        fac[m] = fac.get(m, 0) + 1
+    divs = [(1, 1)]  # (e, phi(e)) para todo divisor e de n
+    for q, k in fac.items():
+        divs = [(e * q**j, ph * (q**j - q ** (j - 1) if j else 1)) for e, ph in divs for j in range(k + 1)]
+    # as phi(e) rotações de ordem e fixam as pinturas boas de um anel de n/e contas
+    total = sum(ph * (pow(c - 1, n // e, _MOD) + (-1) ** (n // e) * (c - 1)) for e, ph in divs) % _MOD
+    group = n
+    if p["flip"]:
+        group = 2 * n  # n ímpar: todo eixo cruza uma aresta, que ficaria com a mesma cor dos dois lados
+        if n % 2 == 0:  # eixos por duas contas fixam um caminho de n/2 + 1 contas; eixos por arestas, nada
+            total += n // 2 * c * pow(c - 1, n // 2, _MOD)
+    return total * pow(group, _MOD - 2, _MOD) % _MOD
+
+
+def _cs_params(rng):
+    return {"L": rng.choice([1, 2, 3, 5])}
+
+
+def _cs_desc(p):
+    return (
+        "`p` is a permutation of the integers 0 to n-1. Count the contiguous subarrays p[l..r] of length at "
+        f"least {p['L']} whose values, once sorted, are consecutive integers (each value exactly one more "
+        "than the previous one).\n\nConstraints: 0 <= n <= 2 * 10**4."
+    )
+
+
+def _cs_inputs(rng, p):
+    def perm(n):
+        xs = list(range(n))
+        rng.shuffle(xs)
+        return (xs,)
+
+    def blocky(n, size):  # blocos de valores consecutivos embaralhados: muitas respostas grandes
+        xs = list(range(n))
+        blocks = [xs[i : i + size] for i in range(0, n, size)]
+        for b in blocks:
+            if rng.random() < 0.5:
+                b.reverse()
+        rng.shuffle(blocks)
+        return ([x for b in blocks for x in b],)
+
+    out = [perm(6), perm(7), ([],), ([0],), ([0, 1, 2, 3, 4],), ([4, 3, 2, 1, 0],)]
+    out += [rng.choice([perm, lambda n: blocky(n, rng.randint(2, 3))])(rng.randint(2, 9)) for _ in range(7)]
+    # pares trocados: max-min fica sempre perto do comprimento, então O(n^2) com corte antecipado não passa
+    return out + [perm(2 * 10**4), blocky(5000, 7), ([i ^ 1 for i in range(2 * 10**4)],)]
+
+
+def _cs_solve(p, perm):
+    n, L = len(perm), p["L"]
+    if n < L:
+        return 0
+    size = 1 << max(1, (n - 1).bit_length())
+    # folha l guarda g(l) = max(l..r) - min(l..r) + l; p[l..r] é bom se g(l) == r (sempre g(l) >= r)
+    mn = [0] * (2 * size)
+    cnt = [0] * (2 * size)
+    lz = [0] * (2 * size)
+    for i in range(size):
+        mn[size + i], cnt[size + i] = (i, 1) if i < n else (10**9, 0)
+    for i in range(size - 1, 0, -1):
+        a, b = mn[2 * i], mn[2 * i + 1]
+        mn[i] = min(a, b)
+        cnt[i] = (cnt[2 * i] if a == mn[i] else 0) + (cnt[2 * i + 1] if b == mn[i] else 0)
+
+    def add(lo, hi, v, node=1, nl=0, nr=size):  # soma v em [lo, hi)
+        if hi <= nl or nr <= lo:
+            return
+        if lo <= nl and nr <= hi:
+            mn[node] += v
+            lz[node] += v
+            return
+        mid = (nl + nr) // 2
+        add(lo, hi, v, 2 * node, nl, mid)
+        add(lo, hi, v, 2 * node + 1, mid, nr)
+        a, b = mn[2 * node], mn[2 * node + 1]
+        m = min(a, b)
+        mn[node] = m + lz[node]
+        cnt[node] = (cnt[2 * node] if a == m else 0) + (cnt[2 * node + 1] if b == m else 0)
+
+    def query(hi, node=1, nl=0, nr=size):  # (mínimo, quantas vezes) em [0, hi), sem empurrar o lazy
+        if hi <= nl:
+            return (10**18, 0)
+        if nr <= hi:
+            return (mn[node], cnt[node])
+        mid = (nl + nr) // 2
+        a, ca = query(hi, 2 * node, nl, mid)
+        b, cb = query(hi, 2 * node + 1, mid, nr)
+        m = min(a, b)
+        return (m + lz[node], (ca if a == m else 0) + (cb if b == m else 0))
+
+    hi_st: list[int] = []  # índices com máximos decrescentes (idem mínimos crescentes)
+    lo_st: list[int] = []
+    total = 0
+    for r, x in enumerate(perm):
+        while hi_st and perm[hi_st[-1]] < x:
+            j = hi_st.pop()
+            add(hi_st[-1] + 1 if hi_st else 0, j + 1, x - perm[j])
+        hi_st.append(r)
+        while lo_st and perm[lo_st[-1]] > x:
+            j = lo_st.pop()
+            add(lo_st[-1] + 1 if lo_st else 0, j + 1, perm[j] - x)
+        lo_st.append(r)
+        if r - L + 1 >= 0:
+            m, k = query(r - L + 2)
+            total += k if m == r else 0
+    return total
+
+
+def _ko_params(rng):
+    return {"k": rng.randint(2, 4), "closed": rng.random() < 0.5}
+
+
+def _ko_desc(p):
+    if p["closed"]:
+        cover = "[l, r, w] covers the integer points l, l+1, ..., r (both ends included)"
+        lim = "0 <= l <= r <= 10**9"
+    else:
+        cover = "[l, r, w] covers the integer points l, l+1, ..., r-1 (r is not included)"
+        lim = "0 <= l < r <= 10**9"
+    return (
+        f"Each interval {cover} and has weight w. Choose a subset of the intervals such that every integer "
+        f"point is covered by at most {p['k']} of the chosen intervals. Return the maximum possible total "
+        f"weight of the chosen intervals.\n\nConstraints: 0 <= len(intervals) <= 300, {lim}, 1 <= w <= 10**6."
+    )
+
+
+def _ko_inputs(rng, p):
+    def ivs(n, hi, maxlen, wmax):
+        out = []
+        for _ in range(n):
+            lo = rng.randint(0, hi - 1)
+            r = min(hi, lo + rng.randint(0 if p["closed"] else 1, maxlen))
+            out.append([lo, max(r, lo + (0 if p["closed"] else 1)), rng.randint(1, wmax)])
+        return (out,)
+
+    k = p["k"]
+    out = [ivs(6, 12, 6, 20), ivs(8, 15, 8, 20), ([],), ([[3, 9, 5]],), ([[0, 5, 2]] * (k + 1),)]
+    out += [([[i, i + 4, 3] for i in range(0, 8, 2)] + [[0, 12, 10]],)]
+    out += [ivs(rng.randint(3, 12), rng.choice([10, 20, 40]), rng.choice([3, 10]), 20) for _ in range(6)]
+    return out + [ivs(300, 10**9, 10**8, 10**6), ivs(300, 2000, 300, 1000)]
+
+
+def _ko_solve(p, intervals):
+    if not intervals:
+        return 0
+    spans = [(l, r + 1 if p["closed"] else r, w) for l, r, w in intervals]  # [l, fim) semiaberto
+    xs = sorted({x for l, e, _ in spans for x in (l, e)})
+    idx = {x: i for i, x in enumerate(xs)}
+    V = len(xs)
+    graph: list[list[list[int]]] = [[] for _ in range(V)]  # [v, cap, custo, índice reverso]
+
+    def add(u, v, cap, cost):
+        graph[u].append([v, cap, cost, len(graph[v])])
+        graph[v].append([u, 0, -cost, len(graph[u]) - 1])
+
+    for i in range(V - 1):
+        add(i, i + 1, p["k"], 0)  # a linha do tempo carrega até k intervalos ao mesmo tempo
+    for l, e, w in spans:
+        add(idx[l], idx[e], 1, -w)
+    best, flow = 0, 0
+    while flow < p["k"]:  # caminhos mínimos sucessivos (Bellman-Ford: há custos negativos)
+        dist = [float("inf")] * V
+        prev: list[tuple[int, int] | None] = [None] * V
+        dist[0] = 0
+        inq = [False] * V
+        queue = [0]
+        while queue:
+            nxt = []
+            for u in queue:
+                inq[u] = False
+                for j, (v, cap, cost, _) in enumerate(graph[u]):
+                    if cap > 0 and dist[u] + cost < dist[v]:
+                        dist[v] = dist[u] + cost
+                        prev[v] = (u, j)
+                        if not inq[v]:
+                            inq[v] = True
+                            nxt.append(v)
+            queue = nxt
+        f, v = p["k"] - flow, V - 1
+        while v:
+            u, j = prev[v]
+            f = min(f, graph[u][j][1])
+            v = u
+        v = V - 1
+        while v:
+            u, j = prev[v]
+            graph[u][j][1] -= f
+            graph[v][graph[u][j][3]][1] += f
+            v = u
+        best -= dist[V - 1] * f
+        flow += f
+    return best
+
+
 FAMILIES: list[Family] = [
     Family("digit_sum", "easy", "def digit_sum(n: int) -> int:", _digit_params, _digit_desc, _digit_inputs, _digit_solve),
     Family("kth_char", "easy", "def transform(s: str) -> str:", _kth_params, _kth_desc, _kth_inputs, _kth_solve),
@@ -819,18 +1028,18 @@ FAMILIES: list[Family] = [
     Family("long_runs", "easy", "def long_runs(s: str) -> list:", _runs_params, _runs_desc, _runs_inputs, _runs_solve),
     Family("pair_count", "easy", "def count_pairs(nums: list[int]) -> int:", _pairs_params, _pairs_desc, _pairs_inputs, _pairs_solve),
     Family("sort_words", "easy", "def sort_words(words: list[str]) -> list[str]:", _sort_params, _sort_desc, _sort_inputs, _sort_solve),
-    Family("spiral", "medium", "def spiral(matrix: list[list[int]]) -> list[int]:", _sp_params, _sp_desc, _sp_inputs, _sp_solve),
-    Family("step_ways", "medium", "def count_ways(n: int) -> int:", _steps_params, _steps_desc, _steps_inputs, _steps_solve),
-    Family("brackets", "medium", "def longest_balanced(s: str) -> int:", _br_params, _br_desc, _br_inputs, _br_solve),
-    Family("grid_passes", "medium", "def min_cost(grid: list[list[int]]) -> int:", _pass_params, _pass_desc, _pass_inputs, _pass_solve),
-    Family("intervals_gap", "medium", "def max_weight(intervals: list[list[int]]) -> int:", _wi_params, _wi_desc, _wi_inputs, _wi_solve),
-    Family("pile_game", "medium", "def first_player_wins(piles: list[int]) -> bool:", _game_params, _game_desc, _game_inputs, _game_solve),
-    Family("digit_count", "hard", "def count_numbers(lo: int, hi: int) -> int:", _dd_params, _dd_desc, _dd_inputs, _dd_solve),
-    Family("avoid_patterns", "hard", "def count_strings(n: int) -> int:", _fp_params, _fp_desc, _fp_inputs, _fp_solve),
-    Family("tree_spread", "hard", "def max_weight(n: int, edges: list[list[int]], weights: list[int]) -> int:", _ts_params, _ts_desc, _ts_inputs, _ts_solve),
-    Family("group_values", "hard", "def min_swaps(nums: list[int]) -> int:", _gc_params, _gc_desc, _gc_inputs, _gc_solve),
-    Family("split_game", "hard", "def first_player_wins(piles: list[int]) -> bool:", _sg_params, _sg_desc, _sg_inputs, _sg_solve),
-    Family("distinct_subseq", "hard", "def count_subsequences(s: str, k: int) -> int:", _ds_params, _ds_desc, _ds_inputs, _ds_solve),
+    Family("digit_count", "medium", "def count_numbers(lo: int, hi: int) -> int:", _dd_params, _dd_desc, _dd_inputs, _dd_solve),
+    Family("avoid_patterns", "medium", "def count_strings(n: int) -> int:", _fp_params, _fp_desc, _fp_inputs, _fp_solve),
+    Family("tree_spread", "medium", "def max_weight(n: int, edges: list[list[int]], weights: list[int]) -> int:", _ts_params, _ts_desc, _ts_inputs, _ts_solve),
+    Family("group_values", "medium", "def min_swaps(nums: list[int]) -> int:", _gc_params, _gc_desc, _gc_inputs, _gc_solve),
+    Family("split_game", "medium", "def first_player_wins(piles: list[int]) -> bool:", _sg_params, _sg_desc, _sg_inputs, _sg_solve),
+    Family("distinct_subseq", "medium", "def count_subsequences(s: str, k: int) -> int:", _ds_params, _ds_desc, _ds_inputs, _ds_solve),
+    Family("min_cut_grid", "hard", "def min_total_cost(cost0: list[list[int]], cost1: list[list[int]]) -> int:", _seg_params, _seg_desc, _seg_inputs, _seg_solve),
+    Family("monotone_fit", "hard", "def min_cost(a: list[int], w: list[int]) -> int:", _wm_params, _wm_desc, _wm_inputs, _wm_solve),
+    Family("chase_game", "hard", "def outcome(n: int, edges: list[list[int]], targets: list[int], runner: int, chaser: int) -> str:", _cg_params, _cg_desc, _cg_inputs, _cg_solve),
+    Family("rings", "hard", "def count_rings(n: int, c: int) -> int:", _rg_params, _rg_desc, _rg_inputs, _rg_solve),
+    Family("consecutive_runs", "hard", "def count_segments(p: list[int]) -> int:", _cs_params, _cs_desc, _cs_inputs, _cs_solve),
+    Family("k_overlap", "hard", "def max_weight(intervals: list[list[int]]) -> int:", _ko_params, _ko_desc, _ko_inputs, _ko_solve),
 ]
 
 

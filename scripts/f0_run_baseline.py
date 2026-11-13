@@ -82,7 +82,7 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
         f0_records = [  # custom de versão antiga do benchmark não entra na tabela nem no gráfico
             r for r in load_results(results_jsonl, phase="F0")
             if not str(r.get("bench", "")).startswith("custom_")
-            # custom_protocol, não eval_protocol: o da Qwen ganha sufixo da amostragem (ex.: custom_v3_k20_pp1.5)
+            # custom_protocol, não eval_protocol: o da Qwen ganha sufixo da amostragem (ex.: custom_v4_k20_pp1.5)
             or (r.get("config") or {}).get("custom_protocol") == CUSTOM_PROTOCOL_ID
         ]
         print(f"Total de registros F0 em {results_jsonl}: {len(f0_records)}\n")

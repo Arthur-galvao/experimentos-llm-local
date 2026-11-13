@@ -6,13 +6,13 @@ from __future__ import annotations
 import itertools
 import time
 import unittest
+from collections import Counter
 from functools import lru_cache
 
 from lib.custom_bench import (
     CUSTOM_PROTOCOL_ID,
     FAMILIES,
     INSTANCES_PER_FAMILY,
-    _SPIRAL_START,
     build_custom_suite,
     custom_extra_metrics,
     make_problem,
@@ -21,95 +21,6 @@ from lib.sandbox import check_solution
 
 
 # ---------------------------------------------------------------- forças brutas (só entradas pequenas)
-
-
-def _spiral_tl_cw(m):
-    m, out = [list(r) for r in m], []
-    while m:
-        out += m.pop(0)
-        m = [list(r) for r in zip(*m)][::-1]  # gira 90° anti-horário
-    return out
-
-
-def _sp(p, m):
-    T = lambda x: [list(r) for r in zip(*x)]  # noqa: E731
-    rot_ccw = lambda x: [list(r) for r in zip(*x)][::-1]  # noqa: E731
-    rot_cw = lambda x: [list(r) for r in zip(*x[::-1])]  # noqa: E731
-    rot180 = lambda x: [r[::-1] for r in x[::-1]]  # noqa: E731
-    view = {
-        ("top-left", "clockwise"): lambda x: x,
-        ("top-left", "counterclockwise"): T,
-        ("top-right", "clockwise"): rot_ccw,
-        ("top-right", "counterclockwise"): lambda x: [r[::-1] for r in x],
-        ("bottom-right", "clockwise"): rot180,
-        ("bottom-right", "counterclockwise"): lambda x: T(rot180(x)),
-        ("bottom-left", "clockwise"): rot_cw,
-        ("bottom-left", "counterclockwise"): lambda x: x[::-1],
-    }[(p["corner"], p["rot"])]
-    return _spiral_tl_cw(view(m))
-
-
-def _steps(p, n):
-    @lru_cache(None)
-    def w(k):
-        return 1 if k == 0 else sum(w(k - s) for s in p["steps"] if s <= k)
-
-    return w(n) % p["mod"]
-
-
-def _br(p, s):
-    pairs = [p["pairs"][i : i + 2] for i in range(0, len(p["pairs"]), 2)]
-
-    def balanced(t):
-        prev = None
-        while t != prev:
-            prev = t
-            for x in pairs:
-                t = t.replace(x, "")
-        return t == ""
-
-    return max((j - i for i in range(len(s) + 1) for j in range(i, len(s) + 1) if balanced(s[i:j])), default=0)
-
-
-def _pass(p, grid):
-    rows, cols, K = len(grid), len(grid[0]), p["K"]
-    inf = float("inf")
-    dist = {(r, c, k): inf for r in range(rows) for c in range(cols) for k in range(K + 1)}
-    dist[(0, 0, 0)] = grid[0][0]
-    if K:
-        dist[(0, 0, 1)] = 0
-    changed = True
-    while changed:
-        changed = False
-        for (r, c, k), d in list(dist.items()):
-            for nr, nc in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
-                if 0 <= nr < rows and 0 <= nc < cols:
-                    for nk, nd in ((k, d + grid[nr][nc]), (k + 1, d)):
-                        if nk <= K and nd < dist[(nr, nc, nk)]:
-                            dist[(nr, nc, nk)] = nd
-                            changed = True
-    return min(dist[(rows - 1, cols - 1, k)] for k in range(K + 1))
-
-
-def _wi(p, intervals):
-    best = 0
-    for k in range(len(intervals) + 1):
-        for combo in itertools.combinations(intervals, k):
-            if all(b[0] - a[1] >= p["g"] or a[0] - b[1] >= p["g"] for a, b in itertools.combinations(combo, 2)):
-                best = max(best, sum(x[2] for x in combo))
-    return best
-
-
-def _game(p, piles):
-    @lru_cache(None)
-    def win(state):
-        for i, x in enumerate(state):
-            for s in p["moves"]:
-                if s <= x and not win(tuple(sorted(state[:i] + (x - s,) + state[i + 1 :]))):
-                    return True
-        return False
-
-    return win(tuple(sorted(piles)))
 
 
 def _dd(p, lo, hi):
@@ -188,19 +99,106 @@ def _ds(p, s, k):
     return sum(all(not bad(a, b) for a, b in zip(t, t[1:])) for t in subs) % (10**9 + 7)
 
 
+def _seg(p, cost0, cost1):
+    R, C = len(cost0), len(cost0[0])
+    cells = [(r, c) for r in range(R) for c in range(C)]
+    near = [(a, b) for a, b in itertools.combinations(cells, 2)
+            if max(abs(a[0] - b[0]), abs(a[1] - b[1])) == 1 and (p["nbr"] == 8 or a[0] == b[0] or a[1] == b[1])]
+    best = None
+    for lab in itertools.product((0, 1), repeat=len(cells)):
+        L = dict(zip(cells, lab))
+        if p["border0"] and any(L[(r, c)] for r, c in cells if r in (0, R - 1) or c in (0, C - 1)):
+            continue
+        cost = sum((cost1 if L[x] else cost0)[x[0]][x[1]] for x in cells) + p["P"] * sum(L[a] != L[b] for a, b in near)
+        best = cost if best is None else min(best, cost)
+    return best
+
+
+def _wm(p, a, w):
+    # existe ótimo com b[i] -/+ i*D num dos valores a[j] -/+ j*D; testa toda sequência monótona deles
+    n, D = len(a), p["D"]
+    sg = 1 if p["dir"] == "inc" else -1
+    cands = sorted({a[j] - sg * j * D for j in range(n)})
+    best = 0 if n == 0 else None
+    for combo in itertools.combinations_with_replacement(cands, n):
+        seq = combo if sg == 1 else combo[::-1]
+        b = [x + sg * i * D for i, x in enumerate(seq)]
+        assert all((b[i + 1] - b[i]) * sg >= D for i in range(n - 1))
+        cost = sum(wi * abs(bi - ai) for wi, bi, ai in zip(w, b, a))
+        best = cost if best is None else min(best, cost)
+    return best
+
+
+def _cg(p, n, edges, targets, runner, chaser):
+    T = set(targets)
+    nxt = {u: ([u] if p["stay"] else []) + [v for x, v in edges if x == u] for u in range(n)}
+    val = {}  # ponto fixo: repete até nenhum estado mudar
+    states = [(r, c, t) for r in range(n) for c in range(n) for t in (0, 1)]
+    changed = True
+    while changed:
+        changed = False
+        for r, c, t in states:
+            if (r, c, t) in val:
+                continue
+            if r == c:
+                v = "chaser"
+            elif r in T:
+                v = "runner"
+            else:
+                kids = [(x, c, 1) for x in nxt[r]] if t == 0 else [(r, x, 0) for x in nxt[c] if x not in T]
+                me, other = ("runner", "chaser") if t == 0 else ("chaser", "runner")
+                if any(val.get(k) == me for k in kids):
+                    v = me
+                elif all(val.get(k) == other for k in kids):
+                    v = other
+                else:
+                    continue
+            val[(r, c, t)] = v
+            changed = True
+    return val.get((runner, chaser, 0 if p["first"] == "runner" else 1), "draw")
+
+
+def _rg(p, n, c):
+    def forms(col):
+        rots = [col[i:] + col[:i] for i in range(n)]
+        return rots + [r[::-1] for r in rots] if p["flip"] else rots
+
+    seen = set()
+    for col in itertools.product(range(c), repeat=n):
+        if all(col[i] != col[(i + 1) % n] for i in range(n)):
+            seen.add(min(forms(col)))
+    return len(seen) % (10**9 + 7)
+
+
+def _cs(p, perm):
+    n = len(perm)
+    return sum(sorted(perm[l:r + 1]) == list(range(min(perm[l:r + 1]), max(perm[l:r + 1]) + 1))
+               for l in range(n) for r in range(l + p["L"] - 1, n))
+
+
+def _ko(p, intervals):
+    best = 0
+    for k in range(len(intervals) + 1):
+        for combo in itertools.combinations(intervals, k):
+            pts = Counter(x for l, r, _ in combo for x in range(l, r + 1 if p["closed"] else r))
+            if all(v <= p["k"] for v in pts.values()):
+                best = max(best, sum(w for _, _, w in combo))
+    return best
+
+
 BRUTE = {
-    "spiral": (_sp, lambda m: True),
-    "step_ways": (_steps, lambda n: n <= 60),
-    "brackets": (_br, lambda s: len(s) <= 20),
-    "grid_passes": (_pass, lambda g: len(g) * len(g[0]) <= 36),
-    "intervals_gap": (_wi, lambda iv: len(iv) <= 12),
-    "pile_game": (_game, lambda piles: len(piles) <= 3 and max(piles, default=0) <= 15),
     "digit_count": (_dd, lambda lo, hi: hi <= 6000),
     "avoid_patterns": (_fp, lambda n: n <= 8),
     "tree_spread": (_ts, lambda n, e, w: n <= 12),
     "group_values": (_gc, lambda nums: len(nums) <= 7),
     "split_game": (_sg, lambda piles: sum(piles) <= 9),
     "distinct_subseq": (_ds, lambda s, k: len(s) <= 12),
+    "min_cut_grid": (_seg, lambda c0, c1: len(c0) * len(c0[0]) <= 12),
+    "monotone_fit": (_wm, lambda a, w: len(a) <= 7),
+    "chase_game": (_cg, lambda n, e, t, r, c: n <= 8),
+    "rings": (_rg, lambda n, c: n <= 7 and c <= 4 and c**n <= 5000),
+    "consecutive_runs": (_cs, lambda perm: len(perm) <= 60),
+    "k_overlap": (_ko, lambda iv: len(iv) <= 12),
 }
 
 
@@ -242,17 +240,6 @@ class TestCustomBench(unittest.TestCase):
         for p in self.full:
             outs = {repr(e) for _, e in p["cases"]}
             self.assertGreater(len(outs), 1, p["task_id"])
-
-    def test_spiral_exemplo_manual_e_cobre_todas_as_combinacoes(self):
-        from lib.custom_bench import _sp_solve
-
-        m = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
-        p = {"corner": "top-left", "rot": "clockwise", "facing": "right"}
-        self.assertEqual(_sp_solve(p, m), [1, 2, 3, 6, 9, 8, 7, 4, 5])
-        p = {"corner": "bottom-left", "rot": "counterclockwise", "facing": "right"}
-        self.assertEqual(_sp_solve(p, m), [7, 8, 9, 6, 3, 2, 1, 4, 5])
-        seen = {(p["params"]["corner"], p["params"]["rot"]) for p in self.full if p["family"] == "spiral"}
-        self.assertEqual(seen, set(_SPIRAL_START))
 
     def test_test_code_aceita_referencia_e_rejeita_errada(self):
         for p in self.full:

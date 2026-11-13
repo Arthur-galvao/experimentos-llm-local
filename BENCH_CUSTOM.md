@@ -21,7 +21,7 @@ python scripts/f0_run_baseline.py --target plot
 | `custom_quick` | 126 (7 por família) | Iterar. Cabe num único lote do vLLM, então o tempo é o da geração mais longa. |
 | `custom_full` | 504 (28 por família, contém o quick) | Confirmar quando a diferença entre duas versões é pequena. |
 
-**Geração (custom_v3):**
+**Geração (desde a custom_v3):**
 - **Orçamento de 81.920 tokens** (`CUSTOM_MAX_NEW_TOKENS`) para todos os modelos. É o que a Qwen recomenda para programação de competição, e o Dory aceita até 256K. Assim o truncamento não decide o acerto.
 - **Amostragem oficial de cada modelo**, copiada da página dele no HF e guardada em `OFFICIAL_SAMPLING` (`lib/dory.py`):
   - Dory: `temperature=1.0`, `top_p=0.95`, sem `top_k` nem penalidade.
@@ -31,7 +31,7 @@ python scripts/f0_run_baseline.py --target plot
 
 **GPU:** 81.920 tokens por resposta pedem memória. O ideal é G4 (96 GB) ou A100 de 80 GB. Na A100 de 40 GB e na L4, o Dory L4 (cache separado por loop) pode ficar lento, com poucas respostas ao mesmo tempo, ou não caber.
 
-A amostragem da Qwen entra no protocolo e no cache (`custom_v3_k20_pp1.5`). Assim, uma rodada com amostragem diferente nunca reaproveita outra. A tabela do `plot` filtra pelo `custom_protocol`.
+A amostragem da Qwen entra no protocolo e no cache (`custom_v4_k20_pp1.5`). Assim, uma rodada com amostragem diferente nunca reaproveita outra. A tabela do `plot` filtra pelo `custom_protocol`.
 
 ## O que é
 
@@ -40,8 +40,8 @@ São 18 famílias de problemas de código, 6 por nível:
 | Nível | Para que serve | Famílias |
 |---|---|---|
 | easy | O Dory acerta tudo. Mede se ele pensa demais em problema simples (F1). | soma de dígitos filtrada, transformação do k-ésimo caractere, soma com filtro de resto, blocos repetidos, pares com soma divisível, ordenação por chave |
-| medium | O Dory acerta a maioria, e os loops se separam (na v1: L1 64%, L2 88%). Avisa cedo se uma fase quebra o raciocínio médio. | espiral a partir de um canto, contagem de escadas mod M, maior trecho balanceado de parênteses, grade com passes grátis (Dijkstra com estado), intervalos com peso e folga, jogo de pilhas (Grundy) |
-| hard | O Dory acerta pouco (alvo de 10% a 25%). É aqui que se vê se uma fase ganhou raciocínio ou só economizou tokens. | DP de dígitos com 3 condições até 10^18, strings sem padrões proibidos até 10^18 (autômato + potência de matriz), conjunto de nós de uma árvore com distância mínima (DP em árvore), menor número de trocas para agrupar valores (DP em bitmask sobre inversões), jogo de pilhas com divisão (Sprague-Grundy), subsequências distintas de tamanho k com restrição entre vizinhos |
+| medium | Técnica conhecida, mas longa. Era o hard da v2 e da v3: o L2 acerta 83%, e o acerto depende do orçamento (16k: 29%, 32k: 79%). Mede economia de tokens. | DP de dígitos com 3 condições até 10^18, strings sem padrões proibidos até 10^18 (autômato + potência de matriz), conjunto de nós de uma árvore com distância mínima (DP em árvore), menor número de trocas para agrupar valores (DP em bitmask sobre inversões), jogo de pilhas com divisão (Sprague-Grundy), subsequências distintas de tamanho k com restrição entre vizinhos |
+| hard | É preciso achar o modelo certo do problema, e o Dory deve acertar pouco (alvo de 10% a 25%, ainda não medido). É aqui que se vê se uma fase ganhou raciocínio ou só economizou tokens. | rotular uma grade com custo por vizinho diferente (corte mínimo), ajustar uma sequência monótona com pesos e passo mínimo (slope trick), perseguição num grafo dirigido com empate (análise retrógrada), anéis de contas sem vizinhas iguais, com ou sem virar (Burnside, n até 10^9), trechos de uma permutação com valores consecutivos (árvore de segmentos sobre max − min), intervalos com no máximo k sobrepostos (fluxo de custo mínimo) |
 
 **Como ler o hard:** com o orçamento grande, o `hard_pass1` mede se o modelo sabe resolver, não se a resposta coube.
 - **Ganho de raciocínio:** o `hard_pass1` (81.920 tokens) da fase sobe acima do L2 base.
@@ -53,14 +53,14 @@ São 18 famílias de problemas de código, 6 por nível:
 
 No quick, o hard tem 42 problemas, e um a mais muda ~2,4 pontos. Para afirmar ganho no hard, use o `custom_full` (168 problemas no hard).
 
-- **Cada instância muda o problema, não só os nomes.** A semente sorteia parâmetros como o conjunto de passos, o tipo de movimento, o canto e o sentido da espiral, o limite de itens ou o módulo, e a resposta certa muda com eles.
+- **Cada instância muda o problema, não só os nomes.** A semente sorteia parâmetros como o módulo, o conjunto de lances, a penalidade e a vizinhança da grade, quem joga primeiro, se o anel pode ser virado ou se os intervalos são fechados, e a resposta certa muda com eles.
 - **O enunciado traz restrições, dois exemplos e uma assinatura fixa.** A correção usa cerca de 14 testes escondidos por problema, com casos de borda. Nos níveis medium e hard há também entradas grandes, que reprovam força bruta exponencial. O limite é de 10 s por problema, folgado para não reprovar uma solução polinomial correta.
 - **É determinístico.** A mesma versão gera sempre os mesmos problemas. Qualquer mudança numa família exige subir `CUSTOM_PROTOCOL_ID`, o que invalida os resultados antigos em vez de misturá-los: o cache por problema é separado por versão, e a tabela e o gráfico só mostram a versão atual.
 
 ## Por que confiar na medição
 
 O `tests/test_custom_bench.py` verifica cinco coisas:
-1. Em cada família medium/hard, a solução de referência bate com uma **força bruta escrita de outro jeito** em pelo menos 100 entradas pequenas. A espiral, por exemplo, é conferida por rotação da matriz em vez de simulação; o agrupamento por trocas, por BFS sobre as trocas; a árvore, testando todos os subconjuntos. Também verifica que a referência resolve cada problema em menos de 3 s, com folga para o limite de 10 s do sandbox.
+1. Em cada família medium/hard, a solução de referência bate com uma **força bruta escrita de outro jeito** em pelo menos 100 entradas pequenas. O agrupamento por trocas, por exemplo, é conferido por BFS sobre as trocas; a árvore e a grade, testando todos os subconjuntos; a perseguição, por ponto fixo em vez de fila; os anéis, listando todas as pinturas. Também verifica que a referência resolve cada problema em menos de 3 s, com folga para o limite de 10 s do sandbox.
 2. Os testes de cada problema **aceitam a referência e rejeitam uma resposta qualquer**, e nenhuma instância tem todas as saídas iguais.
 3. Determinismo, e `quick` é prefixo de `full`.
 4. O caminho completo funciona: gerador falso → `eval_custom` → sandbox → `results.jsonl`. Resposta truncada conta como erro, e uma segunda execução não duplica a linha.
@@ -94,7 +94,7 @@ Ainda não mede: VRAM (F5) e média de loops por token (F2 adaptativo), porque d
   - Rodada quick (commit 2840852), pass@1 easy / medium / hard: L1 1.00 / 0.74 / 0.19, L2 1.00 / 0.81 / 0.29, L4 1.00 / 0.83 / 0.24, Qwen 0.88 / 0.19 / 0.00.
   - No hard, 29 das 30 falhas do L2 foram truncamento em 16k. `tree_spread` deu 0% em todos os modelos e `distinct_subseq` só passou de 0 no L4 (14%). Elas não foram aliviadas: o orçamento da v3 mostra se são difíceis de verdade ou só longas.
   - Erro de protocolo: a Qwen rodou com a amostragem do Dory, sem `top_k=20` nem `presence_penalty=1.5`, e com 16k tokens, quando a Qwen recomenda de 32k a 81k. Os números dela na v1 e na v2 não valem como controle.
-- **custom_v3** (atual): mesmas instâncias da v2, com orçamento de 81.920 tokens e amostragem oficial de cada modelo. Também passa a medir pass@1 por orçamento, mediana de tokens e `loop`.
+- **custom_v3**: mesmas instâncias da v2, com orçamento de 81.920 tokens e amostragem oficial de cada modelo. Também passa a medir pass@1 por orçamento, mediana de tokens e `loop`.
   - Rodada quick (commit a08cf56), pass@1 easy / medium / hard:
     - L1: 1.00 / 0.81 / 0.74
     - L2: 1.00 / 0.90 / 0.83
@@ -105,5 +105,8 @@ Ainda não mede: VRAM (F5) e média de loops por token (F2 adaptativo), porque d
   - As falhas do L2 no hard são 7: 4 erros de execução (TypeError, KeyError, SyntaxError), 2 respostas erradas e 1 timeout.
   - A Qwen truncou 11 respostas. Em 8 delas a cauda repete "Wait." sem parar, mesmo com o `presence_penalty`. O score marcou só 7 como `loop`: no `tree_spread/3`, a repetição é quase só de espaços de indentação e cabe em poucas palavras da janela de 2.000.
   - Leitura: o hard da v3 mede economia de tokens (a curva por orçamento), mas não mede ganho de raciocínio, porque o L2 já acerta 83% dele.
+- **custom_v4** (atual): o hard da v3 virou medium, o medium da v3 saiu e entraram 6 hard novas, em que o difícil é achar o modelo do problema (corte mínimo, fluxo, slope trick, análise retrógrada, Burnside, árvore de segmentos), não escrever uma DP longa. Orçamento e amostragem iguais aos da v3.
+  - O easy e o medium da v4 são as mesmas instâncias da v3. A semente não depende do nível, e a geração usou o mesmo orçamento e a mesma amostragem. Por isso o `eval_custom` copia essas linhas do cache da v3 (`reuse_cache`, campo `reused_from`), e uma rodada da v4 só gera os 42 problemas do hard novo no quick.
+  - Ainda não rodou. O L2 base roda na primeira sessão de GPU da F1, junto com a avaliação da fase.
 
 Depois de cada rodada de baselines, confira o `family_pass1`. No hard, uma família que fique em 0% para todos os loops não mede nada; nesse caso, alivie os parâmetros dela e suba a versão.
