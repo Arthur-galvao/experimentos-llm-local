@@ -94,6 +94,16 @@ Ainda não mede: VRAM (F5) e média de loops por token (F2 adaptativo), porque d
   - Rodada quick (commit 2840852), pass@1 easy / medium / hard: L1 1.00 / 0.74 / 0.19, L2 1.00 / 0.81 / 0.29, L4 1.00 / 0.83 / 0.24, Qwen 0.88 / 0.19 / 0.00.
   - No hard, 29 das 30 falhas do L2 foram truncamento em 16k. `tree_spread` deu 0% em todos os modelos e `distinct_subseq` só passou de 0 no L4 (14%). Elas não foram aliviadas: o orçamento da v3 mostra se são difíceis de verdade ou só longas.
   - Erro de protocolo: a Qwen rodou com a amostragem do Dory, sem `top_k=20` nem `presence_penalty=1.5`, e com 16k tokens, quando a Qwen recomenda de 32k a 81k. Os números dela na v1 e na v2 não valem como controle.
-- **custom_v3** (atual): mesmas instâncias da v2, com orçamento de 81.920 tokens e amostragem oficial de cada modelo. Também passa a medir pass@1 por orçamento, mediana de tokens e `loop`. Os baselines precisam ser refeitos.
+- **custom_v3** (atual): mesmas instâncias da v2, com orçamento de 81.920 tokens e amostragem oficial de cada modelo. Também passa a medir pass@1 por orçamento, mediana de tokens e `loop`.
+  - Rodada quick (commit a08cf56), pass@1 easy / medium / hard:
+    - L1: 1.00 / 0.81 / 0.74
+    - L2: 1.00 / 0.90 / 0.83
+    - L4: 1.00 / 0.90 / 0.83
+    - Qwen: 0.98 / 0.79 / 0.69
+  - Pass@1 do hard com orçamento de 16k / 32k: L2 0.29 / 0.79, Qwen 0.07 / 0.33. Mediana de tokens da CoT no hard: L2 17,3k, Qwen 38,4k.
+  - Na v2, o hard baixo era truncamento, não dificuldade. O Dory não truncou nenhuma resposta: a mais longa do L2 tem cerca de 36k tokens, e o `loop_score` dele fica sempre abaixo de 0,17.
+  - As falhas do L2 no hard são 7: 4 erros de execução (TypeError, KeyError, SyntaxError), 2 respostas erradas e 1 timeout.
+  - A Qwen truncou 11 respostas. Em 8 delas a cauda repete "Wait." sem parar, mesmo com o `presence_penalty`. O score marcou só 7 como `loop`: no `tree_spread/3`, a repetição é quase só de espaços de indentação e cabe em poucas palavras da janela de 2.000.
+  - Leitura: o hard da v3 mede economia de tokens (a curva por orçamento), mas não mede ganho de raciocínio, porque o L2 já acerta 83% dele.
 
 Depois de cada rodada de baselines, confira o `family_pass1`. No hard, uma família que fique em 0% para todos os loops não mede nada; nesse caso, alivie os parâmetros dela e suba a versão.
