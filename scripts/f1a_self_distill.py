@@ -1,18 +1,24 @@
-"""F1a: autodestilação. O Dory L2 gera N amostras por problema do TACO, o sandbox roda os testes e o SFT
-fica com o trace correto de menor CoT.
+"""F1a: autodestilação em cascata. O Dory L2 tenta cada problema do TACO do modo mais barato ao mais caro
+(sem raciocínio -> raciocínio "efficient" -> raciocínio completo), o sandbox roda os testes e o SFT fica
+com o trace correto de menos tokens. Um problema resolvido num estágio não entra nos seguintes, então os
+fáceis nunca pagam 8 amostras longas.
 
 Saídas no Drive (`data/`):
-- `f1a/problems.jsonl`: problemas escolhidos (enunciado + testes), já sem sobreposição com os benchmarks;
-- `f1a/samples_<config>.jsonl`: TODAS as amostras, com o resultado do sandbox. As erradas (tipo do erro e
-  teste que falhou) são os ramos mortos e os casos de borda do SFT arbóreo, e o p̂ de cada problema
+- `f1a/problems_<id>.jsonl`: problemas escolhidos (enunciado + testes), sem sobreposição com os benchmarks;
+- `f1a/samples_<estágio>_<config>.jsonl`: TODAS as amostras, com o resultado do sandbox. As erradas (tipo do
+  erro e teste que falhou) são os ramos mortos e os casos de borda do SFT arbóreo, e o p̂ de cada problema
   separa direto de armadilha no currículo e no bônus (1 - p̂)² da F1c (arquitetura_teorica_consolidada_v1);
-- `short_cot_sft.jsonl`: menor trace correto por problema, com ~20% de exemplos de CoT vazia;
-- `f1a/stats.json`: redução de tokens e distribuição do p̂.
+- `short_cot_sft.jsonl`: trace correto mais curto por problema; CoT vazia só onde o modelo acertou todas
+  as amostras sem raciocinar, limitada a ~20% dos exemplos;
+- `f1a/stats.json`: acerto e tokens por estágio, redução de tokens do trace escolhido.
 
-Uso:
-  python scripts/f1a_self_distill.py --prepare-only     # só seleção e dedup (sem GPU)
-  python scripts/f1a_self_distill.py --n-problems 500   # gera, corrige e monta o SFT; retoma de onde parou
-  python scripts/f1a_self_distill.py --build-only       # remonta o SFT a partir das amostras já geradas
+Uso (um estágio por processo, porque cada um cria um motor vLLM com contexto diferente):
+  python scripts/f1a_self_distill.py --prepare-only                  # só seleção e dedup (sem GPU)
+  python scripts/f1a_self_distill.py --stage nothink --n-problems 500
+  python scripts/f1a_self_distill.py --stage efficient --n-problems 500
+  python scripts/f1a_self_distill.py --stage full --n-problems 500   # o caro: só o que sobrou sem solução
+  python scripts/f1a_self_distill.py --build-only                    # remonta o SFT do que já foi gerado
+Cada estágio retoma de onde parou e remonta o SFT ao terminar.
 """
 
 from __future__ import annotations
@@ -32,14 +38,58 @@ from pathlib import Path
 # TACO-verified filtrado pelo DeepCoder (MIT, enunciados humanos, >= 5 testes por problema). Ficam fora:
 # KodCode (gerado pelo GPT-4o), primeintellect (sintético) e lcbv5 (são problemas do LCB v6 da avaliação).
 DATASET = ("agentica-org/DeepCoder-Preview-Dataset", "taco")
+# O task_id é o índice da linha: sem fixar o commit, uma mudança no Hub trocaria os problemas das amostras guardadas.
+DATASET_REV = "177913a7bd43791646ef6a43645caa3c871ab3db"
+SELECTION_ID = "v2"  # subir ao mudar os filtros de select_problems (o arquivo de problemas é um cache)
 SEED = 42
 NGRAM = 13
 OVERLAP_THRESHOLD = 0.3  # fração dos 13-gramas em comum com UM problema de benchmark que já conta como cópia
+# Problema com mais de uma saída válida reprova solução certa na comparação exata, e ela viraria ramo morto falso.
+MULTI_ANSWER_RE = re.compile(
+    r"print any|output any|any of them|any (valid|correct|suitable|such)|"
+    r"(multiple|several|many) (possible |valid |correct |optimal )?(answers|solutions)",
+    re.IGNORECASE,
+)
 MAX_PROMPT_TOKENS = 3500  # o motor vLLM reserva max_new_tokens + 4096 de contexto
 BATCH_PROBLEMS = 64  # x N amostras por chamada ao vLLM; o cache grava ao fim de cada lote
 EMPTY_COT_FRAC = 0.2
 TEST_TIMEOUT_S = 6.0  # igual ao LCB
 TEST_MEMORY_MB = 4096
+REF_TPS = 800  # tokens/s do L2 na A100 medidos no F0 (results/f0_cost_estimate.json), só para o teto de custo
+A100_CU_PER_HOUR = 8.88
+
+# Cascata, do mais barato ao mais caro. `template` são os kwargs do chat template oficial do Dory
+# (chat_template.jinja, conferido em 2026-11-14): enable_thinking=False pré-preenche `<think></think>` e
+# medium_effort=True acrescenta "{reasoning effort: efficient}" à mensagem do usuário.
+# Teto de 8192 nos estágios com raciocínio: os rollouts da F1c param em 4096, trace maior não treina nada lá.
+STAGES = {
+    "nothink": {"template": {"enable_thinking": False}, "n_samples": 4, "max_new_tokens": 2048},
+    "efficient": {"template": {"enable_thinking": True, "medium_effort": True}, "n_samples": 8, "max_new_tokens": 8192},
+    "full": {"template": {"enable_thinking": True}, "n_samples": 8, "max_new_tokens": 8192},
+}
+EFFORT_MARK = "{reasoning effort: efficient}"
+
+
+def _solved(stage: str, row: dict) -> bool:
+    """Sem raciocínio só conta se acertou todas (vira exemplo de CoT vazia); com raciocínio basta um trace certo."""
+    return row["p_hat"] == 1.0 if stage == "nothink" else row["p_hat"] > 0
+
+
+def build_prompt(tok, problem: str, stage: str) -> str:
+    from lib.evals import LCB_SYSTEM_MESSAGE, _build_lcb_prompt
+
+    messages = [
+        {"role": "system", "content": LCB_SYSTEM_MESSAGE},
+        {"role": "user", "content": _build_lcb_prompt(problem, "")},
+    ]
+    prompt = str(
+        tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **STAGES[stage]["template"])
+    )
+    # O template ignora calado um kwarg que não conhece: conferir que o modo pedido entrou mesmo no prompt.
+    tail = "<think></think>" if stage == "nothink" else "<think>\n"
+    if not prompt.endswith(tail) or (EFFORT_MARK in prompt) != (stage == "efficient"):
+        raise RuntimeError(f"O chat template não aplicou o modo '{stage}'; final do prompt: {prompt[-120:]!r}")
+    return prompt
 
 
 def _ngrams(text: str) -> set[tuple[str, ...]]:
@@ -85,11 +135,8 @@ def select_problems(n: int, tok, problems_path: Path) -> list[dict]:
 
     from datasets import load_dataset
 
-    from lib.evals import LCB_SYSTEM_MESSAGE, _build_lcb_prompt
-    from lib.gen import format_chat_prompt
-
     print(f"[f1a] Carregando {DATASET[0]} ({DATASET[1]}) e os benchmarks para o dedup...")
-    ds = load_dataset(*DATASET, split="train")
+    ds = load_dataset(*DATASET, split="train", revision=DATASET_REV)
     max_overlap = _overlap_checker(_bench_texts())
     order = list(range(len(ds)))
     random.Random(SEED).shuffle(order)
@@ -115,12 +162,14 @@ def select_problems(n: int, tok, problems_path: Path) -> list[dict]:
         ):
             dropped["testes inválidos"] += 1
             continue
+        if MULTI_ANSWER_RE.search(row["problem"]):
+            dropped["mais de uma saída válida"] += 1
+            continue
         if max_overlap(row["problem"]) >= OVERLAP_THRESHOLD:
             dropped["sobreposição com benchmark"] += 1
             continue
-        prompt = format_chat_prompt(
-            tok, _build_lcb_prompt(row["problem"], ""), system_prompt=LCB_SYSTEM_MESSAGE, enable_thinking=True
-        )
+        # o prompt do modo efficient é o mais longo dos três
+        prompt = build_prompt(tok, row["problem"], "efficient")
         if len(tok.encode(prompt, add_special_tokens=False)) > MAX_PROMPT_TOKENS:
             dropped["prompt longo"] += 1
             continue
@@ -142,15 +191,43 @@ def select_problems(n: int, tok, problems_path: Path) -> list[dict]:
     return chosen
 
 
-def generate_samples(problems, tok, progress, *, n_samples, max_new_tokens, temperature, top_p) -> None:
+def stage_pending(problems: list[dict], stage: str, progress: dict) -> list[dict]:
+    """O que este estágio ainda gera: problemas que todos os estágios anteriores já rodaram e não resolveram."""
+    earlier = list(STAGES)[: list(STAGES).index(stage)]
+    pending, waiting, solved = [], 0, 0
+    for p in problems:
+        tid = p["task_id"]
+        if progress[stage].is_done(tid):
+            continue
+        for s in earlier:  # em ordem: quem foi resolvido cedo nem tem linha nos estágios seguintes
+            row = progress[s].get(tid)
+            if row is None:
+                waiting += 1
+                break
+            if _solved(s, row):
+                solved += 1
+                break
+        else:
+            pending.append(p)
+    print(
+        f"[f1a] estágio '{stage}': {len(pending)} problemas a gerar; {solved} já resolvidos num estágio anterior; "
+        f"{waiting} esperando um estágio anterior rodar."
+    )
+    return pending
+
+
+def generate_samples(pending: list[dict], tok, progress, stage: str, *, temperature: float, top_p: float) -> None:
     from lib.dory import DORY_HF_REPO
-    from lib.evals import LCB_SYSTEM_MESSAGE, _build_lcb_prompt
-    from lib.gen import THINK_CLOSE, format_chat_prompt, generate
+    from lib.gen import THINK_CLOSE, generate
     from lib.metrics import repetition_score
     from lib.sandbox import check_solution
 
-    pending = [p for p in problems if not progress.is_done(p["task_id"])]
-    print(f"[f1a] {len(pending)} problemas pendentes de {len(problems)} ({n_samples} amostras cada).")
+    n_samples, max_new_tokens = STAGES[stage]["n_samples"], STAGES[stage]["max_new_tokens"]
+    worst_h = len(pending) * n_samples * max_new_tokens / REF_TPS / 3600
+    print(
+        f"[f1a] {n_samples} amostras de até {max_new_tokens} tokens por problema. Teto de custo (toda amostra "
+        f"no limite, {REF_TPS} tokens/s): {worst_h:.1f} h de GPU, ~{worst_h * A100_CU_PER_HOUR:.0f} CU na A100."
+    )
     pool = ThreadPoolExecutor(max_workers=max(1, (os.cpu_count() or 2) - 2))
 
     def record(batch, outs, futs) -> None:
@@ -167,7 +244,10 @@ def generate_samples(problems, tok, progress, *, n_samples, max_new_tokens, temp
                         "passed": sb.passed,
                         "error_type": sb.error_type,
                         "error_msg": sb.stderr[:300],  # WA traz o índice do teste que falhou
-                        "truncated": bool(o.n_total_tokens >= max_new_tokens and THINK_CLOSE not in o.text),
+                        # sem raciocínio o </think> já vem no prompt, então só o tamanho diz se cortou
+                        "truncated": bool(
+                            o.n_total_tokens >= max_new_tokens and (stage == "nothink" or THINK_CLOSE not in o.text)
+                        ),
                         "loop_score": repetition_score(o.cot_text),
                     }
                 )
@@ -183,16 +263,10 @@ def generate_samples(problems, tok, progress, *, n_samples, max_new_tokens, temp
     inflight, gen_times, n_tokens = None, [], 0
     for start in range(0, len(pending), BATCH_PROBLEMS):
         batch = pending[start : start + BATCH_PROBLEMS]
-        prompts = [
-            format_chat_prompt(
-                tok, _build_lcb_prompt(p["problem"], ""), system_prompt=LCB_SYSTEM_MESSAGE, enable_thinking=True
-            )
-            for p in batch
-        ]
         t0 = time.perf_counter()
         outs = generate(
             DORY_HF_REPO,
-            prompts,
+            [build_prompt(tok, p["problem"], stage) for p in batch],
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             n_loops=2,
@@ -204,6 +278,11 @@ def generate_samples(problems, tok, progress, *, n_samples, max_new_tokens, temp
         )
         gen_times.append(time.perf_counter() - t0)
         assert len(outs) == len(batch) * n_samples, (len(outs), len(batch), n_samples)
+        # Semente fixa com n amostras: se o motor devolver cópias, o lote inteiro sai repetido e a CU vai fora.
+        if len(batch) > 1 and all(
+            len({o.text for o in outs[j * n_samples : (j + 1) * n_samples]}) == 1 for j in range(len(batch))
+        ):
+            raise RuntimeError("As amostras de cada problema saíram idênticas: o vLLM não variou a semente.")
         # A correção do lote anterior roda na CPU enquanto este gerava; se a sessão cair, perde-se 1 lote.
         if inflight is not None:
             record(*inflight)
@@ -223,84 +302,125 @@ def generate_samples(problems, tok, progress, *, n_samples, max_new_tokens, temp
         eta_h = statistics.mean(gen_times) * (left / BATCH_PROBLEMS) / 3600
         print(
             f"[f1a] lote {start // BATCH_PROBLEMS + 1}: {len(batch)} problemas em {gen_times[-1] / 60:.1f} min "
-            f"({n_tokens / sum(gen_times):.0f} tokens/s); faltam {left} problemas, ~{eta_h:.1f} h de GPU."
+            f"({n_tokens / sum(gen_times):.0f} tokens/s); faltam {left} problemas, ~{eta_h:.1f} h de GPU "
+            f"(~{eta_h * A100_CU_PER_HOUR:.0f} CU na A100)."
         )
     if inflight is not None:
         record(*inflight)
     pool.shutdown()
 
 
-def build_sft(rows: list[dict], problems: dict[str, dict], empty_frac: float = EMPTY_COT_FRAC):
-    """Menor CoT correta por problema. CoT vazia vai para os problemas que o modelo acerta sempre (p̂ = 1)
-    com a menor CoT, até `empty_frac` dos exemplos: lá a resposta não depende do raciocínio."""
+def build_sft(problems: list[dict], rows: dict[str, dict[str, dict]], empty_frac: float = EMPTY_COT_FRAC):
+    """Um exemplo por problema resolvido. `rows[estágio][task_id]` é a linha gravada por `generate_samples`.
+
+    A escolha é pelo total de tokens (CoT + resposta): pela CoT sozinha ganharia o trace que empurra o
+    raciocínio para depois do `</think>`. Devolve (exemplos, CoT vazias cortadas pelo limite `empty_frac`).
+    """
     examples = []
-    for r in rows:
-        ok = [s for s in r["samples"] if s["passed"]]
-        if not ok:
-            continue
-        best = min(ok, key=lambda s: s["n_cot_tokens"])
+    for p in problems:
+        tid = p["task_id"]
+        mine = {s: rows[s][tid] for s in STAGES if tid in rows.get(s, {})}
+        nothink = mine.get("nothink")
+        if nothink is not None and _solved("nothink", nothink):
+            stage, ok = "nothink", nothink["samples"]
+        else:
+            cands = [(s, x) for s in ("efficient", "full") if s in mine for x in mine[s]["samples"] if x["passed"]]
+            if not cands:
+                continue
+            stage = min(cands, key=lambda c: c[1]["n_total_tokens"])[0]
+            ok = [x for s, x in cands if s == stage]
+        best = min(ok, key=lambda x: x["n_total_tokens"])
         examples.append(
             {
-                "task_id": r["item_id"],
-                "problem": problems[r["item_id"]]["problem"],
+                "task_id": tid,
+                "problem": p["problem"],
                 "cot": best["cot"],
                 "answer": best["answer"],
                 "n_cot_tokens": best["n_cot_tokens"],
-                "empty_cot": False,
-                "p_hat": r["p_hat"],
+                "n_total_tokens": best["n_total_tokens"],
+                "empty_cot": stage == "nothink",
+                "stage": stage,
+                "p_hat": {s: r["p_hat"] for s, r in mine.items()},
+                # para a redução pareada: as outras amostras corretas do mesmo problema e estágio
+                "n_correct": len(ok),
+                "mean_total_correct": statistics.mean(x["n_total_tokens"] for x in ok),
             }
         )
-    always = sorted((e for e in examples if e["p_hat"] == 1.0), key=lambda e: e["n_cot_tokens"])
-    for e in always[: int(empty_frac * len(examples))]:
-        e.update(empty_cot=True, cot="", orig_n_cot_tokens=e["n_cot_tokens"], n_cot_tokens=0)
-    return examples
+    n_thinking = sum(not e["empty_cot"] for e in examples)
+    max_empty = int(empty_frac / (1 - empty_frac) * n_thinking)
+    empties = [e for e in examples if e["empty_cot"]]
+    cut = {e["task_id"] for e in empties[max_empty:]}
+    return [e for e in examples if e["task_id"] not in cut], len(cut)
 
 
-def sft_stats(rows: list[dict], examples: list[dict]) -> dict:
-    every = [s for r in rows for s in r["samples"]]
-    correct = [s for s in every if s["passed"]]
-    kept = [e["n_cot_tokens"] for e in examples if not e["empty_cot"]]
-    mean_all = statistics.mean(s["n_cot_tokens"] for s in every) if every else 0.0
-    mean_kept = statistics.mean(kept) if kept else 0.0
-    p_hats = [r["p_hat"] for r in rows]
+def sft_stats(problems: list[dict], rows: dict[str, dict[str, dict]], examples: list[dict], n_cut: int) -> dict:
+    stages = {}
+    for stage in STAGES:
+        rs = [rows[stage][p["task_id"]] for p in problems if p["task_id"] in rows.get(stage, {})]
+        if not rs:
+            continue
+        samples = [s for r in rs for s in r["samples"]]
+        stages[stage] = {
+            "n_problems": len(rs),
+            "n_solved": sum(_solved(stage, r) for r in rs),
+            "pass1_mean": round(statistics.mean(r["p_hat"] for r in rs), 4),
+            "tokens_mean_per_sample": round(statistics.mean(s["n_total_tokens"] for s in samples), 1),
+            "truncated_frac": round(sum(s["truncated"] for s in samples) / len(samples), 4),
+            "error_types": dict(Counter(str(s["error_type"]) for s in samples if not s["passed"])),
+        }
+    thinking = [e for e in examples if not e["empty_cot"]]
+    paired = [1 - e["n_total_tokens"] / e["mean_total_correct"] for e in thinking if e["n_correct"] >= 2]
+    cots = [e["n_cot_tokens"] for e in thinking]
     return {
-        "n_problems": len(rows),
+        "n_problems": len(problems),
         "n_examples": len(examples),
-        "n_empty_cot": sum(e["empty_cot"] for e in examples),
-        "solve_rate_any": round(len(examples) / max(1, len(rows)), 4),
-        "pass1_mean": round(statistics.mean(p_hats), 4) if p_hats else 0.0,
-        "cot_mean_all_samples": round(mean_all, 1),
-        "cot_mean_correct_samples": round(statistics.mean(s["n_cot_tokens"] for s in correct), 1) if correct else 0.0,
-        "cot_mean_kept": round(mean_kept, 1),
-        "cot_median_kept": statistics.median(kept) if kept else 0,
-        # redução pedida na ESPEC: trace escolhido vs média de todas as amostras
-        "reduction_vs_all_samples": round(1 - mean_kept / mean_all, 4) if mean_all else 0.0,
-        "truncated_frac": round(sum(s["truncated"] for s in every) / max(1, len(every)), 4),
-        "error_types": dict(Counter(str(s["error_type"]) for s in every if not s["passed"])),
-        "p_hat_hist": {
-            "0": sum(p == 0 for p in p_hats),
-            "(0,0.5]": sum(0 < p <= 0.5 for p in p_hats),
-            "(0.5,1)": sum(0.5 < p < 1 for p in p_hats),
-            "1": sum(p == 1 for p in p_hats),
-        },
+        "n_empty_cot": len(examples) - len(thinking),
+        "n_empty_cot_cut_by_cap": n_cut,
+        "examples_by_stage": dict(Counter(e["stage"] for e in examples)),
+        "cot_mean_kept": round(statistics.mean(cots), 1) if cots else 0.0,
+        # serve para calibrar o L_ref da recompensa da F1c
+        "cot_median_kept": statistics.median(cots) if cots else 0,
+        "n_over_4096_total_tokens": sum(e["n_total_tokens"] > 4096 for e in thinking),  # não cabem no rollout da F1c
+        # trace escolhido vs média das amostras CORRETAS do mesmo problema (só problemas com 2 ou mais)
+        "reduction_vs_correct_samples": round(statistics.mean(paired), 4) if paired else 0.0,
+        "stages": stages,
     }
 
 
 def _self_check() -> None:
-    def row(tid, lens_passed):
-        samples = [{"n_cot_tokens": n, "passed": ok, "truncated": False, "error_type": None if ok else "WrongAnswer",
-                    "cot": f"c{n}", "answer": f"a{n}"} for n, ok in lens_passed]
-        return {"item_id": tid, "p_hat": sum(ok for _, ok in lens_passed) / len(lens_passed), "samples": samples}
+    def row(spec):  # spec: [(total de tokens, passou)]
+        samples = [{"n_cot_tokens": n // 2, "n_total_tokens": n, "passed": ok, "truncated": False,
+                    "error_type": None if ok else "WrongAnswer", "cot": f"c{n}", "answer": f"a{n}"} for n, ok in spec]
+        return {"p_hat": sum(ok for _, ok in spec) / len(spec), "samples": samples}
 
-    rows = [row(f"t{i}", [(100 + i, True), (50 + i, True)]) for i in range(5)] + [
-        row("hard", [(900, False), (300, True)]),
-        row("none", [(10, False), (20, False)]),
-    ]
-    ex = build_sft(rows, {r["item_id"]: {"problem": ""} for r in rows})
+    ids = ["easy0", "easy1", "flaky", "eff", "full", "none"] + [f"e{i}" for i in range(3)]
+    problems = [{"task_id": t, "problem": ""} for t in ids]
+    rows = {
+        "nothink": {t: row([(30, True), (20, True)]) for t in ("easy0", "easy1")}
+        | {t: row([(30, True), (20, False)]) for t in ids[2:]},  # acertar só às vezes não vira CoT vazia
+        "efficient": {"flaky": row([(500, True), (300, True)]), "eff": row([(900, False), (400, True)]),
+                      "full": row([(800, False)]), "none": row([(800, False)])}
+        | {f"e{i}": row([(600, True)]) for i in range(3)},
+        "full": {"full": row([(5000, True), (3000, True)]), "none": row([(8192, False)])},
+    }
+    ex, n_cut = build_sft(problems, rows)
     by = {e["task_id"]: e for e in ex}
-    assert "none" not in by and by["hard"]["cot"] == "c300" and not by["hard"]["empty_cot"]
-    assert [e["task_id"] for e in ex if e["empty_cot"]] == ["t0"]  # int(0.2 * 6) = 1, o mais curto dos p̂ = 1
-    assert by["t0"]["cot"] == "" and by["t0"]["orig_n_cot_tokens"] == 50 and by["t1"]["cot"] == "c51"
+    assert "none" not in by and by["flaky"]["answer"] == "a300" and by["eff"]["answer"] == "a400"
+    assert by["full"]["stage"] == "full" and by["full"]["answer"] == "a3000"
+    assert by["full"]["mean_total_correct"] == 4000
+    # 6 exemplos com raciocínio -> cabe int(0.25 * 6) = 1 CoT vazia; a outra é cortada
+    assert by["easy0"]["empty_cot"] and by["easy0"]["answer"] == "a20" and "easy1" not in by and n_cut == 1
+    stats = sft_stats(problems, rows, ex, n_cut)
+    assert stats["stages"]["nothink"]["n_solved"] == 2
+    assert stats["examples_by_stage"] == {"nothink": 1, "efficient": 5, "full": 1}
+
+    class Progress(dict):
+        is_done = dict.__contains__
+
+    prog = {s: Progress(r) for s, r in rows.items()}
+    assert [p["task_id"] for p in stage_pending(problems, "full", prog)] == []  # full e none já rodaram
+    del prog["full"]["none"], prog["efficient"]["e0"]
+    assert [p["task_id"] for p in stage_pending(problems, "full", prog)] == ["none"]  # e0 espera o efficient
 
 
 def main() -> None:
@@ -309,12 +429,12 @@ def main() -> None:
         sys.path.insert(0, str(repo_root))
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-problems", type=int, default=500)
-    ap.add_argument("--n-samples", type=int, default=8)
-    ap.add_argument("--max-new-tokens", type=int, default=16384)  # amostra truncada conta como erro
-    ap.add_argument("--temperature", type=float, default=None, help="padrão: a oficial do Dory")
+    ap.add_argument("--stage", choices=list(STAGES))
     ap.add_argument("--prepare-only", action="store_true")
     ap.add_argument("--build-only", action="store_true")
     args = ap.parse_args()
+    if not (args.stage or args.prepare_only or args.build_only):
+        ap.error(f"escolha --stage ({', '.join(STAGES)}), --prepare-only ou --build-only")
     _self_check()
 
     from lib.dory import DORY_HF_REPO, enforce_tokenizer_report, load_dory_tokenizer, official_sampling
@@ -325,33 +445,38 @@ def main() -> None:
     paths = setup_drive_and_cache(drive_root=DEFAULT_DRIVE_ROOT, local_fallback_root=repo_root)
     out_dir = paths["data"] / "f1a"
     sampling = official_sampling(DORY_HF_REPO)
-    temperature = float(sampling["temperature"] if args.temperature is None else args.temperature)
-    top_p = float(sampling["top_p"])
-    tag = f"L2_n{args.n_samples}_t{temperature:g}_p{top_p:g}_m{args.max_new_tokens}"
-    progress = ResumableProgress(out_dir / f"samples_{tag}.jsonl")
+    temperature, top_p = float(sampling["temperature"]), float(sampling["top_p"])
+    tags = {
+        s: f"{s}_L2_n{c['n_samples']}_t{temperature:g}_p{top_p:g}_m{c['max_new_tokens']}" for s, c in STAGES.items()
+    }
+    progress = {s: ResumableProgress(out_dir / f"samples_{tag}.jsonl") for s, tag in tags.items()}
 
     ensure_model_files(DORY_HF_REPO)
     tok = load_dory_tokenizer(DORY_HF_REPO)
-    problems = select_problems(args.n_problems, tok, out_dir / "problems.jsonl")
+    problems = select_problems(args.n_problems, tok, out_dir / f"problems_{SELECTION_ID}.jsonl")
     if args.prepare_only:
         return
-    if not args.build_only:
-        enforce_tokenizer_report(verify_tokenizer_equivalence(DORY_HF_REPO))
-        generate_samples(
-            problems, tok, progress,
-            n_samples=args.n_samples, max_new_tokens=args.max_new_tokens, temperature=temperature, top_p=top_p,
-        )
+    if args.stage and not args.build_only:
+        pending = stage_pending(problems, args.stage, progress)
+        if pending:
+            enforce_tokenizer_report(verify_tokenizer_equivalence(DORY_HF_REPO))
+            generate_samples(pending, tok, progress[args.stage], args.stage, temperature=temperature, top_p=top_p)
 
-    by_id = {p["task_id"]: p for p in problems}
-    rows = [progress.get(p["task_id"]) for p in problems if progress.is_done(p["task_id"])]
-    examples = build_sft(rows, by_id)
+    rows = {s: {p["task_id"]: pr.get(p["task_id"]) for p in problems if pr.is_done(p["task_id"])}
+            for s, pr in progress.items()}
+    examples, n_cut = build_sft(problems, rows)
     sft_path = paths["data"] / "short_cot_sft.jsonl"
     with sft_path.open("w", encoding="utf-8") as f:
         for e in examples:
-            # prompt pronto (o mesmo da geração): a F1b só aplica o chat template
+            # Prompt de treino = o da avaliação, sem a marca de esforço: o modelo deve ser curto por padrão.
             msgs = {"system": LCB_SYSTEM_MESSAGE, "user": _build_lcb_prompt(e["problem"], "")}
-            f.write(json.dumps({**e, **msgs, "samples_file": progress.cache_file.name}, ensure_ascii=False) + "\n")
-    stats = {"config": {"dataset": "/".join(DATASET), "samples": tag, "seed": SEED}, **sft_stats(rows, examples)}
+            f.write(json.dumps({**e, **msgs, "samples_file": progress[e["stage"]].cache_file.name},
+                               ensure_ascii=False) + "\n")
+    stats = {
+        "config": {"dataset": "/".join(DATASET), "revision": DATASET_REV, "selection": SELECTION_ID, "seed": SEED,
+                   "samples": tags},
+        **sft_stats(problems, rows, examples, n_cut),
+    }
     (out_dir / "stats.json").write_text(json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[f1a] {sft_path} ({len(examples)} exemplos)\n" + json.dumps(stats, indent=2, ensure_ascii=False))
 

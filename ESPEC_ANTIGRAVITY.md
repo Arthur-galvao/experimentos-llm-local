@@ -153,11 +153,22 @@ O notebook de gate imprime `PASSOU` ou `REPROVOU` com os números. Se reprovar, 
 **Saída:** `data/short_cot_sft.jsonl` + estatísticas (redução média de tokens em relação à média das amostras).
 
 **Como foi implementado** (`scripts/f1a_self_distill.py`, notebook `F1a_self_distill.ipynb`):
-- **Dataset:** `agentica-org/DeepCoder-Preview-Dataset`, config `taco` (TACO-verified filtrado, MIT, enunciados humanos, >= 5 testes). Ficam de fora o KodCode (gerado pelo GPT-4o), o `primeintellect` (sintético) e o `lcbv5` (são problemas do LCB v6). Só problemas stdin/stdout: os funcionais do TACO não trazem a assinatura no enunciado.
+- **Dataset:** `agentica-org/DeepCoder-Preview-Dataset`, config `taco`, com o commit fixado (TACO-verified filtrado, MIT, enunciados humanos, >= 5 testes). Ficam de fora o KodCode (gerado pelo GPT-4o), o `primeintellect` (sintético) e o `lcbv5` (são problemas do LCB v6). Só problemas stdin/stdout: os funcionais do TACO não trazem a assinatura no enunciado. Sai também o problema cujo enunciado aceita mais de uma saída ("print any"), porque a comparação exata reprovaria soluções certas.
 - **Dedup:** 13-gramas de palavras contra LCB v6, HumanEval+, MBPP+ e o custom; sai o problema que divide >= 30% dos 13-gramas com algum problema de benchmark.
-- **Amostragem:** a oficial do Dory (temperatura 1.0, top_p 0.95), no lugar dos ~0.7, igual à da avaliação e à dos rollouts da F1c. Orçamento de 16384 tokens; amostra truncada conta como erro. Prompt e sandbox iguais aos do LCB (6 s por teste).
-- **Guarda todas as amostras**, inclusive as erradas, com tipo do erro e teste que falhou: são os ramos mortos e os casos de borda do SFT arbóreo (`CONCEITO_RACIOCINIO_ARBOREO.md`, seção 8.1). O p̂ de cada problema (acertos / 8) separa direto de armadilha para o currículo e para o bônus (1 − p̂)² da F1c.
-- **CoT vazia:** vai para os problemas com p̂ = 1 de menor CoT, até 20% dos exemplos.
+- **Cascata, no lugar de N=8 amostras longas para todo problema.** Um problema resolvido num estágio não entra nos seguintes:
+
+  | Estágio | Chat template do Dory | Amostras | Teto de tokens | Conta como resolvido |
+  |---|---|---|---|---|
+  | `nothink` | `enable_thinking=False` | 4 | 2048 | acertou as 4 |
+  | `efficient` | `medium_effort=True` | 8 | 8192 | acertou alguma |
+  | `full` | padrão | 8 | 8192 | acertou alguma |
+
+  Os dois modos curtos estão no `chat_template.jinja` oficial, mas o card do modelo não os documenta. O script confere que o modo entrou no prompt antes de gerar.
+- **Amostragem:** a oficial do Dory (temperatura 1.0, top_p 0.95), no lugar dos ~0.7. Teto de 8192 porque os rollouts da F1c param em 4096. Prompt e sandbox iguais aos do LCB (6 s por teste).
+- **Escolha do trace:** o correto com menos tokens no total (CoT + resposta), para não premiar quem escreve o raciocínio depois do `</think>`.
+- **CoT vazia:** só nos problemas em que o modelo acertou as 4 amostras sem raciocinar, limitada a 20% dos exemplos.
+- **Guarda todas as amostras**, inclusive as erradas, com tipo do erro e teste que falhou: são os ramos mortos e os casos de borda do SFT arbóreo (`CONCEITO_RACIOCINIO_ARBOREO.md`, seção 8.1). O p̂ de cada problema em cada estágio separa direto de armadilha para o currículo e para o bônus (1 − p̂)² da F1c.
+- **Estatísticas** (`data/f1a/stats.json`): acerto e tokens por estágio, mediana da CoT escolhida (calibra o L_ref da F1c) e redução do trace escolhido contra as outras amostras corretas do mesmo problema.
 
 #### F1b: SFT (`F1b_sft_short_cot.ipynb`)
 - SFT do Dory em `short_cot_sft.jsonl`, com a config do perfil de hardware.
