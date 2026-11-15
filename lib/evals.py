@@ -300,6 +300,9 @@ def _run_problems_loop(
     `reuse_cache=(sufixo_antigo, task_id -> task_id antigo ou None)` copia para o cache novo as linhas do
     cache de outro protocolo cuja geração continua valendo, sem gerar de novo.
     """
+    if isinstance(model, str) and not getattr(tokenizer, "chat_template", None):
+        # sem template o prompt sai sem o formato de chat do modelo e a avaliação seria inválida em silêncio
+        raise ValueError("tokenizer sem chat_template: o prompt de um modelo real sairia sem o template de chat.")
     effective_tier = "smoke" if smoke else eval_tier
     allow_hf_fallback = bool(smoke)
     # Amostragem fora da do Dory (Qwen: top_k/presence) entra no protocolo e no cache: resultado e gerações
@@ -326,6 +329,15 @@ def _run_problems_loop(
                 f"(esperado '{protocol_id}'); ele NÃO será reaproveitado e a avaliação será refeita."
             )
             existing = None
+        if existing is not None and (
+            existing.get("checkpoint") != checkpoint
+            or (existing.get("config") or {}).get("max_new_tokens") != max_new_tokens
+        ):
+            print(
+                f"[eval] Resultado antigo de {run_id} em {bench_name} ({effective_tier}) é de outro checkpoint "
+                f"ou orçamento de tokens; ele NÃO será reaproveitado e a avaliação será refeita."
+            )
+            existing = None
         if existing is not None:
             print(f"[eval] Skipping {run_id} on {bench_name} ({effective_tier}): already in {results_path}")
             return existing
@@ -334,7 +346,8 @@ def _run_problems_loop(
     if not active_problems:
         raise ValueError(f"No problems loaded for benchmark '{bench_name}'.")
 
-    cache_file = Path(cache_dir) / f"{run_id}_{bench_name}_{effective_tier}{cache_suffix}.jsonl"
+    ckpt_tag = "" if checkpoint == "base" else f"_{checkpoint}"  # base mantém o nome dos caches já existentes
+    cache_file = Path(cache_dir) / f"{run_id}_{bench_name}_{effective_tier}{cache_suffix}{ckpt_tag}.jsonl"
     progress = ResumableProgress(cache_file)
     if reuse_cache is not None:  # gerações de outra versão do protocolo que continuam válidas
         old_suffix, old_id_of = reuse_cache
@@ -575,7 +588,7 @@ def _load_evalplus_problems(bench: str) -> list[dict[str, Any]]:
                 }
             )
         return problems
-    except Exception:
+    except ImportError:
         from datasets import load_dataset  # type: ignore[import-not-found]
 
         hf_name = "evalplus/humanevalplus" if bench == "humaneval+" else "evalplus/mbppplus"
@@ -1011,7 +1024,8 @@ def eval_custom(
         smoke_n=smoke_n,
         force=force,
         protocol_id=CUSTOM_PROTOCOL_ID,
-        cache_suffix=f"_{CUSTOM_PROTOCOL_ID}",  # cache por problema não mistura versões do benchmark
+        # cache por problema não mistura versões do benchmark nem orçamentos de tokens
+        cache_suffix=f"_{CUSTOM_PROTOCOL_ID}" + ("" if budget == CUSTOM_MAX_NEW_TOKENS else f"_m{budget}"),
         extra_config_fn=lambda rows: custom_extra_metrics(rows, max_new_tokens=budget),
         # só com o orçamento do protocolo: a v3 gerou com ele
         reuse_cache=(f"_{REUSE_CACHE_FROM}", reused_task_id) if budget == CUSTOM_MAX_NEW_TOKENS else None,

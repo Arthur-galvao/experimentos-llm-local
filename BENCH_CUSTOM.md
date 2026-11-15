@@ -108,5 +108,6 @@ Ainda não mede: VRAM (F5) e média de loops por token (F2 adaptativo), porque d
 - **custom_v4** (atual): o hard da v3 virou medium, o medium da v3 saiu e entraram 6 hard novas, em que o difícil é achar o modelo do problema (corte mínimo, fluxo, slope trick, análise retrógrada, Burnside, árvore de segmentos), não escrever uma DP longa. Orçamento e amostragem iguais aos da v3.
   - O easy e o medium da v4 são as mesmas instâncias da v3. A semente não depende do nível, e a geração usou o mesmo orçamento e a mesma amostragem. Por isso o `eval_custom` copia essas linhas do cache da v3 (`reuse_cache`, campo `reused_from`), e uma rodada da v4 só gera os 42 problemas do hard novo no quick.
   - Ainda não rodou. O L2 base roda na primeira sessão de GPU da F1, junto com a avaliação da fase.
+  - Correção de 2026-11-14 (não muda as instâncias): o sandbox só aprova se os testes rodaram até o fim. Antes, uma solução que encerrava o processo com código 0 antes dos testes (ex.: `sys.exit(0)` no bloco `__main__`) contava como acerto. As linhas da v3 copiadas para o easy e o medium foram corrigidas com a regra antiga e podem conter esses acertos falsos.
 
 Depois de cada rodada de baselines, confira o `family_pass1`. No hard, uma família que fique em 0% para todos os loops não mede nada; nesse caso, alivie os parâmetros dela e suba a versão.

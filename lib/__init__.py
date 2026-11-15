@@ -32,7 +32,6 @@ from .dory import (
     DoryConfig,
     DoryForCausalLM,
     DoryModel,
-    init_new_tokens_embeddings,
     load_dory,
     load_dory_tokenizer,
     logit_lens_per_loop,
@@ -49,7 +48,6 @@ from .gen import (
     evict_hf_models_from_gpu,
     format_chat_prompt,
     generate,
-    run_vllm_in_subprocess,
     split_cot_and_answer,
 )
 from .sandbox import (
@@ -106,7 +104,6 @@ __all__ = [
     "DoryConfig",
     "DoryForCausalLM",
     "DoryModel",
-    "init_new_tokens_embeddings",
     "load_dory",
     "load_dory_tokenizer",
     "logit_lens_per_loop",
@@ -121,7 +118,6 @@ __all__ = [
     "evict_hf_models_from_gpu",
     "format_chat_prompt",
     "generate",
-    "run_vllm_in_subprocess",
     "split_cot_and_answer",
     "SandboxResult",
     "check_evalplus_solution",

@@ -1,4 +1,4 @@
-"""Critical Module: Dory-4B architecture, loop controller, logit lens per loop, and untied token initialization.
+"""Critical Module: Dory-4B architecture, loop controller, logit lens per loop.
 
 Implements the exact architecture and weights layout of `nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16`
 (nGPT hyperspherical normalization + Looped Recurrent Middle Block) as a native HuggingFace
@@ -8,6 +8,7 @@ and `AutoModelForCausalLM`.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -16,6 +17,7 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
+    import torch.utils.checkpoint
     from transformers import (
         AutoConfig,
         AutoModelForCausalLM,
@@ -310,6 +312,22 @@ class DoryRotaryEmbedding(nn.Module):
         return _apply_rotary(q), _apply_rotary(k)
 
 
+@functools.lru_cache(maxsize=4)
+def _causal_mask(
+    q_len: int, kv_len: int, sliding_window: int, dtype: Any, device: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Máscara causal (+ janela deslizante) compartilhada pelas camadas; NUNCA modificar o resultado in-place."""
+    # Query positions correspond to [kv_len - q_len .. kv_len - 1]
+    q_pos = torch.arange(kv_len - q_len, kv_len, device=device).unsqueeze(1)
+    k_pos = torch.arange(kv_len, device=device).unsqueeze(0)
+    allowed = k_pos <= q_pos  # [q_len, kv_len]
+    if sliding_window > 0:
+        allowed = allowed & ((q_pos - k_pos) < sliding_window)
+    attn_bias = torch.zeros((1, 1, q_len, kv_len), dtype=dtype, device=device)
+    attn_bias = attn_bias.masked_fill(~allowed.unsqueeze(0).unsqueeze(0), float("-inf"))
+    return allowed, attn_bias
+
+
 class DoryAttention(nn.Module):
     """Dory nGPT Attention mixer with QK hyperspherical normalization and sigmoid output gate."""
 
@@ -397,17 +415,9 @@ class DoryAttention(nn.Module):
             v_rep = v_t
 
         # Build causal + optional sliding-window + optional padding mask
-        # Query positions correspond to [kv_len - q_len .. kv_len - 1]
-        q_pos = torch.arange(kv_len - q_len, kv_len, device=hidden_states.device).unsqueeze(1)
-        k_pos = torch.arange(kv_len, device=hidden_states.device).unsqueeze(0)
-        allowed = k_pos <= q_pos  # [q_len, kv_len]
-        if self.sliding_window is not None and self.sliding_window > 0:
-            allowed = allowed & ((q_pos - k_pos) < self.sliding_window)
-
-        attn_bias = torch.zeros(
-            (1, 1, q_len, kv_len), dtype=q_t.dtype, device=hidden_states.device
+        allowed, attn_bias = _causal_mask(
+            q_len, kv_len, self.sliding_window or 0, q_t.dtype, hidden_states.device
         )
-        attn_bias = attn_bias.masked_fill(~allowed.unsqueeze(0).unsqueeze(0), float("-inf"))
 
         if attention_mask is not None and attention_mask.ndim == 2:
             # attention_mask: [bsz, total_seq] or [bsz, q_len] where 1 = valid, 0 = pad
@@ -652,17 +662,15 @@ class DoryModel(DoryPreTrainedModel):
         if active_loops < 1:
             raise ValueError(f"n_recurrent_loops must be >= 1, got {active_loops}")
 
+        def run_layer(layer: nn.Module, h: torch.Tensor, loop_idx: int, is_last_loop: bool) -> torch.Tensor:
+            args = (h, position_ids, past_key_values, loop_idx, is_last_loop, past_seen_tokens, attention_mask)
+            if self.gradient_checkpointing and self.training:
+                return torch.utils.checkpoint.checkpoint(layer, *args, use_reentrant=False)
+            return layer(*args)
+
         # 1. Input block (executed once)
         for layer in self.layers[:n_in]:
-            h = layer(
-                h,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                loop_idx=0,
-                is_last_loop=True,
-                past_seen_tokens=past_seen_tokens,
-                attention_mask=attention_mask,
-            )
+            h = run_layer(layer, h, 0, True)
 
         # 2. Recurrent middle block (executed `active_loops` times)
         input_h = h
@@ -673,15 +681,7 @@ class DoryModel(DoryPreTrainedModel):
             is_last = loop_idx == (active_loops - 1)
             h = justnorm(state.float() + input_h.float()).to(state.dtype)
             for layer in self.layers[n_in : n_in + n_rec]:
-                h = layer(
-                    h,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    loop_idx=loop_idx,
-                    is_last_loop=is_last,
-                    past_seen_tokens=past_seen_tokens,
-                    attention_mask=attention_mask,
-                )
+                h = run_layer(layer, h, loop_idx, is_last)
             state = justnorm(h)
             h = state
             if collect_loop_states:
@@ -689,15 +689,7 @@ class DoryModel(DoryPreTrainedModel):
 
         # 3. Output block (executed once)
         for layer in self.layers[n_in + n_rec :]:
-            h = layer(
-                h,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                loop_idx=0,
-                is_last_loop=True,
-                past_seen_tokens=past_seen_tokens,
-                attention_mask=attention_mask,
-            )
+            h = run_layer(layer, h, 0, True)
 
         if past_key_values is not None:
             past_key_values.seen_tokens = past_seen_tokens + seq_len
@@ -878,17 +870,13 @@ class DoryForCausalLM(DoryPreTrainedModel, GenerationMixin):
             n_loops=n_loops,
             collect_loop_states=bool(output_hidden_states),
         )
-        logits = self.lm_head(hidden_states)
+        # No treino com labels os logits completos não são materializados (vocabulário em fp32 = 0,5 MB/token)
+        logits = None if (labels is not None and self.training) else self.lm_head(hidden_states)
 
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            keep = labels[..., 1:] != -100
+            loss = F.cross_entropy(self.lm_head(hidden_states[..., :-1, :][keep]), labels[..., 1:][keep])
 
         all_hidden = tuple(loop_states + [hidden_states]) if output_hidden_states else None
         return CausalLMOutputWithPast(
@@ -1176,7 +1164,6 @@ def load_dory(
     kv_cache_mode: Literal["per_loop", "last_loop"] = "per_loop",
     torch_dtype: Any = "bfloat16",
     device_map: str | dict[str, Any] | None = "auto",
-    load_in_4bit: bool = False,
     fix_mistral_regex: bool | None = None,
     **kwargs: Any,
 ) -> tuple[DoryForCausalLM, Any]:
@@ -1189,14 +1176,6 @@ def load_dory(
     tokenizer = load_dory_tokenizer(model_name_or_path, fix_mistral_regex=fix_mistral_regex)
 
     load_kwargs: dict[str, Any] = dict(kwargs)
-    if load_in_4bit:
-        from transformers import BitsAndBytesConfig
-
-        load_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
 
     config = DoryConfig.from_pretrained(model_name_or_path)
     config.n_recurrent_loops = int(n_loops)
@@ -1336,101 +1315,6 @@ def logit_lens_per_loop(
     if was_training:
         model.train()
     return results_per_loop
-
-
-def init_new_tokens_embeddings(
-    model: PreTrainedModel,
-    tokenizer: Any,
-    new_tokens: list[str] | dict[str, str],
-) -> dict[str, int]:
-    """Add custom tokens (e.g., DSL primitives or `<latent>`) to `tokenizer`, resize `model`
-    embeddings with `tie_word_embeddings=False`, and initialize BOTH the input embedding
-    (`embed_tokens` / `embeddings`) and the untied output head (`lm_head`) of each new token
-    as the mean of the embeddings of its constituent subtokens (Section 4 F3 & Section 6).
-
-    Args:
-        model: A `PreTrainedModel` (such as `DoryForCausalLM`) with `tie_word_embeddings=False`.
-        tokenizer: HuggingFace tokenizer (or compatible tokenizer with `add_tokens` & `encode`).
-        new_tokens: Either a list of token strings (e.g. `["<FOR>", "<IF>"]`) where each token's
-            semantic seed text is the token stripped of `<`/`>` (or the token string itself),
-            or a dict mapping `{new_token_str: seed_description_text}`.
-
-    Returns:
-        Mapping `{new_token_str: assigned_token_id}`.
-    """
-    if isinstance(new_tokens, dict):
-        token_to_seed = dict(new_tokens)
-        token_list = list(token_to_seed.keys())
-    else:
-        token_list = list(new_tokens)
-        token_to_seed = {}
-        for tok in token_list:
-            stripped = tok.strip("<>").replace("_", " ").strip().lower()
-            token_to_seed[tok] = stripped if stripped else tok
-
-    old_vocab_size = len(tokenizer)
-
-    # Pre-tokenize seeds BEFORE adding new tokens so they decompose into existing subtokens
-    seed_subtoken_ids: dict[str, list[int]] = {}
-    for tok, seed_text in token_to_seed.items():
-        ids = tokenizer.encode(seed_text, add_special_tokens=False)
-        valid_ids = [i for i in ids if 0 <= i < old_vocab_size]
-        seed_subtoken_ids[tok] = valid_ids
-
-    tokenizer.add_tokens(token_list, special_tokens=False)
-    new_vocab_size = len(tokenizer)
-    model.resize_token_embeddings(new_vocab_size)
-
-    input_emb = model.get_input_embeddings()
-    output_emb = model.get_output_embeddings()
-
-    assigned_ids: dict[str, int] = {}
-    with torch.no_grad():
-        in_w = input_emb.weight
-        out_w = output_emb.weight if output_emb is not None and hasattr(output_emb, "weight") else None
-        out_scale = (
-            output_emb.logit_scale
-            if output_emb is not None and hasattr(output_emb, "logit_scale")
-            else None
-        )
-
-        # Fallback mean across old vocabulary
-        global_in_mean = in_w[:old_vocab_size].float().mean(dim=0).to(in_w.dtype)
-        global_out_mean = (
-            out_w[:old_vocab_size].float().mean(dim=0).to(out_w.dtype)
-            if out_w is not None
-            else None
-        )
-        global_scale_mean = (
-            out_scale[:old_vocab_size].float().mean().to(out_scale.dtype)
-            if out_scale is not None
-            else None
-        )
-
-        for tok in token_list:
-            tok_id = tokenizer.convert_tokens_to_ids(tok)
-            assigned_ids[tok] = int(tok_id)
-            sub_ids = seed_subtoken_ids.get(tok, [])
-            if sub_ids:
-                idx_tensor = torch.tensor(sub_ids, dtype=torch.long, device=in_w.device)
-                in_vec = in_w.index_select(0, idx_tensor).float().mean(dim=0).to(in_w.dtype)
-                in_w[tok_id].copy_(in_vec)
-                if out_w is not None:
-                    idx_out = idx_tensor.to(out_w.device)
-                    out_vec = out_w.index_select(0, idx_out).float().mean(dim=0).to(out_w.dtype)
-                    out_w[tok_id].copy_(out_vec)
-                if out_scale is not None:
-                    idx_s = idx_tensor.to(out_scale.device)
-                    s_val = out_scale.index_select(0, idx_s).float().mean().to(out_scale.dtype)
-                    out_scale[tok_id].copy_(s_val)
-            else:
-                in_w[tok_id].copy_(global_in_mean)
-                if out_w is not None and global_out_mean is not None:
-                    out_w[tok_id].copy_(global_out_mean)
-                if out_scale is not None and global_scale_mean is not None:
-                    out_scale[tok_id].copy_(global_scale_mean)
-
-    return assigned_ids
 
 
 # ==============================================================================
@@ -1674,41 +1558,6 @@ if not _HAS_TORCH:  # pragma: no cover
                 )
             results_per_loop.append({"loop_idx": idx + 1, "positions": positions_info})
         return results_per_loop
-
-    def init_new_tokens_embeddings(  # type: ignore[no-redef]
-        model: Any,
-        tokenizer: Any,
-        new_tokens: list[str] | dict[str, str],
-    ) -> dict[str, int]:
-        if isinstance(new_tokens, dict):
-            token_to_seed = dict(new_tokens)
-            token_list = list(token_to_seed.keys())
-        else:
-            token_list = list(new_tokens)
-            token_to_seed = {
-                t: (t.strip("<>").replace("_", " ").strip().lower() or t) for t in token_list
-            }
-
-        old_vocab_size = len(tokenizer)
-        seed_subtoken_ids: dict[str, list[int]] = {}
-        for tok, seed_text in token_to_seed.items():
-            ids = tokenizer.encode(seed_text, add_special_tokens=False)
-            seed_subtoken_ids[tok] = [i for i in ids if 0 <= i < old_vocab_size]
-
-        tokenizer.add_tokens(token_list, special_tokens=False)
-        model.resize_token_embeddings(len(tokenizer))
-
-        in_w = model.get_input_embeddings().weight
-        out_w = model.get_output_embeddings().weight
-        assigned: dict[str, int] = {}
-        for tok in token_list:
-            tok_id = tokenizer.convert_tokens_to_ids(tok)
-            assigned[tok] = int(tok_id)
-            sub_ids = seed_subtoken_ids.get(tok, [])
-            if sub_ids:
-                in_w[tok_id] = in_w[sub_ids].mean_axis0()
-                out_w[tok_id] = out_w[sub_ids].mean_axis0()
-        return assigned
 
 
 DEFAULT_EQUIVALENCE_PROMPTS: tuple[str, ...] = (

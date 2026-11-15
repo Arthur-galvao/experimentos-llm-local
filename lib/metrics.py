@@ -30,29 +30,36 @@ def repetition_score(text: str, window_words: int = 2000, n: int = 8) -> float:
     return round(1.0 - len(set(grams)) / len(grams), 4)
 
 
+def run_cost(record: dict[str, Any]) -> float:
+    """Custo de um run: tokens gerados (CoT + resposta) x custo por token dos loops (equivalente a L2)."""
+    n_loops = record.get("n_loops")
+    factor = 1.0 if n_loops is None else loop_compute_factor(int(n_loops))
+    return float(record["tokens_total_mean"]) * factor
+
+
 def is_pareto_dominated(candidate: dict[str, Any], others: list[dict[str, Any]]) -> bool:
     """A point `candidate` is Pareto-dominated if another point in `others` has:
-      - pass1 >= candidate['pass1'] AND tokens_cot_mean <= candidate['tokens_cot_mean']
+      - pass1 >= candidate['pass1'] AND run_cost <= candidate's run_cost
       - with at least one strict inequality.
     """
     c_pass = float(candidate["pass1"])
-    c_tok = float(candidate["tokens_cot_mean"])
+    c_tok = run_cost(candidate)
     for other in others:
         if other is candidate:
             continue
         o_pass = float(other["pass1"])
-        o_tok = float(other["tokens_cot_mean"])
+        o_tok = run_cost(other)
         if o_pass >= c_pass and o_tok <= c_tok and (o_pass > c_pass or o_tok < c_tok):
             return True
     return False
 
 
 def compute_pareto_frontier(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return the non-dominated Pareto frontier sorted by `tokens_cot_mean` ascending."""
+    """Return the non-dominated Pareto frontier sorted by `run_cost` ascending."""
     if not records:
         return []
     frontier = [r for r in records if not is_pareto_dominated(r, records)]
-    frontier.sort(key=lambda r: (float(r["tokens_cot_mean"]), -float(r["pass1"])))
+    frontier.sort(key=lambda r: (run_cost(r), -float(r["pass1"])))
     # Deduplicate identical coordinates
     deduped: list[dict[str, Any]] = []
     for pt in frontier:
@@ -61,7 +68,7 @@ def compute_pareto_frontier(records: list[dict[str, Any]]) -> list[dict[str, Any
             continue
         prev = deduped[-1]
         if (
-            abs(float(pt["tokens_cot_mean"]) - float(prev["tokens_cot_mean"])) < 1e-6
+            abs(run_cost(pt) - run_cost(prev)) < 1e-6
             and abs(float(pt["pass1"]) - float(prev["pass1"])) < 1e-6
         ):
             continue
@@ -77,26 +84,16 @@ def plot_pareto(
     baseline_phase: str = "F0",
     title: str | None = None,
 ) -> Path:
-    """Generate and save a scatter plot of `pass@1 x tokens_cot_mean` with the Pareto frontier
+    """Generate and save a scatter plot of `pass@1 x run_cost` with the Pareto frontier
     highlighted and baseline runs marked (Section 3.4 of ESPEC_ANTIGRAVITY.md).
     """
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        import matplotlib
+    import matplotlib
 
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        # Minimal valid 1x1 PNG fallback when matplotlib is not installed in a bare environment
-        _MINIMAL_PNG = (
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-            b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
-            b"\x00\x00\x03\x01\x01\x00\x18\xdd\x8d\xb0\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
-        out.write_bytes(_MINIMAL_PNG)
-        return out
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
     filtered = [
         r for r in records if (bench_filter is None or r.get("bench") == bench_filter)
@@ -105,7 +102,7 @@ def plot_pareto(
     fig, ax = plt.subplots(figsize=(8.5, 5.5), dpi=150)
     if not filtered:
         ax.set_title(title or "Fronteira de Pareto (sem dados)")
-        ax.set_xlabel("Tokens médios de CoT (menor é melhor)")
+        ax.set_xlabel("Tokens gerados x custo dos loops (equivalente a L2; menor é melhor)")
         ax.set_ylabel("pass@1 (maior é melhor)")
         fig.tight_layout()
         fig.savefig(out)
@@ -118,7 +115,7 @@ def plot_pareto(
 
     if baselines:
         ax.scatter(
-            [float(r["tokens_cot_mean"]) for r in baselines],
+            [run_cost(r) for r in baselines],
             [float(r["pass1"]) for r in baselines],
             marker="D",
             s=80,
@@ -128,7 +125,7 @@ def plot_pareto(
         )
     if non_baselines:
         ax.scatter(
-            [float(r["tokens_cot_mean"]) for r in non_baselines],
+            [run_cost(r) for r in non_baselines],
             [float(r["pass1"]) for r in non_baselines],
             marker="o",
             s=80,
@@ -138,7 +135,7 @@ def plot_pareto(
         )
 
     if frontier:
-        fx = [float(r["tokens_cot_mean"]) for r in frontier]
+        fx = [run_cost(r) for r in frontier]
         fy = [float(r["pass1"]) for r in frontier]
         ax.plot(
             fx,
@@ -158,7 +155,7 @@ def plot_pareto(
             label = f"{label} (L={r['n_loops']})"
         ax.annotate(
             label,
-            (float(r["tokens_cot_mean"]), float(r["pass1"])),
+            (run_cost(r), float(r["pass1"])),
             textcoords="offset points",
             xytext=(6, 5),
             fontsize=8,
@@ -167,7 +164,7 @@ def plot_pareto(
 
     bench_title = f" — {bench_filter}" if bench_filter else ""
     ax.set_title(title or f"Fronteira de Pareto: pass@1 vs Tokens de CoT{bench_title}")
-    ax.set_xlabel("Tokens médios de CoT (menor = mais comprimido)")
+    ax.set_xlabel("Tokens gerados x custo dos loops (equivalente a L2; menor é melhor)")
     ax.set_ylabel("pass@1 (maior = mais preciso)")
     ax.grid(True, linestyle=":", alpha=0.6)
     ax.legend(loc="best")
@@ -177,6 +174,16 @@ def plot_pareto(
     return out
 
 
+def _loses_tier(cand: dict[str, Any], base: dict[str, Any]) -> bool:
+    """True se o candidato tem pass1 menor que o baseline em algum tier (easy/medium/hard) medido em ambos."""
+    for tier in ("easy", "medium", "hard"):
+        c = (cand.get("config") or {}).get(f"{tier}_pass1")
+        b = (base.get("config") or {}).get(f"{tier}_pass1")
+        if c is not None and b is not None and float(c) < float(b):
+            return True
+    return False
+
+
 def check_phase_gate(
     candidate_records: list[dict[str, Any]],
     previous_records: list[dict[str, Any]],
@@ -184,14 +191,17 @@ def check_phase_gate(
     baseline_scicode_pass1: float | None = None,
     candidate_scicode_pass1: float | None = None,
     max_scicode_drop_pp: float = 2.0,
+    baseline_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate the phase gate criterion (Section 3.5 of ESPEC_ANTIGRAVITY.md):
     1. At least one candidate point strictly dominates or extends the previous Pareto frontier:
-       - strictly lower `tokens_cot_mean` with equal-or-higher `pass1`, OR
-       - strictly higher `pass1` with equal-or-lower `tokens_cot_mean`, OR
+       - strictly lower `run_cost` with equal-or-higher `pass1`, OR
+       - strictly higher `pass1` with equal-or-lower `run_cost`, OR
        - is non-dominated when merged with `previous_records` and improves the frontier.
     2. SciCode does not drop more than `max_scicode_drop_pp` percentage points (0.02 in [0,1] scale)
        relative to the baseline.
+    3. With `baseline_record`, a candidate cannot win if its `config[<tier>_pass1]` (easy/medium/hard) is
+       lower than the baseline's in any tier where both have it.
 
     Prints 'PASSOU' or 'REPROVOU' with justification and returns a structured verdict dict.
     """
@@ -200,18 +210,21 @@ def check_phase_gate(
     winning_points: list[str] = []
 
     if not prev_frontier and candidate_records:
-        advances_pareto = True
-        winning_points = [str(r.get("run_id", "candidate")) for r in candidate_records]
+        winners = [r for r in candidate_records if baseline_record is None or not _loses_tier(r, baseline_record)]
+        advances_pareto = bool(winners)
+        winning_points = [str(r.get("run_id", "candidate")) for r in winners]
     else:
         for cand in candidate_records:
             c_pass = float(cand["pass1"])
-            c_tok = float(cand["tokens_cot_mean"])
+            c_tok = run_cost(cand)
+            if baseline_record is not None and _loses_tier(cand, baseline_record):
+                continue
             # Check if candidate dominates at least one point on the previous frontier
             # or is non-dominated by the previous frontier with strictly better efficiency
             dominated_by_prev = is_pareto_dominated(cand, prev_frontier)
             strictly_beats_prev = any(
-                (c_tok < float(p["tokens_cot_mean"]) and c_pass >= float(p["pass1"]))
-                or (c_pass > float(p["pass1"]) and c_tok <= float(p["tokens_cot_mean"]))
+                (c_tok < run_cost(p) and c_pass >= float(p["pass1"]))
+                or (c_pass > float(p["pass1"]) and c_tok <= run_cost(p))
                 for p in prev_frontier
             )
             if not dominated_by_prev and (strictly_beats_prev or not prev_frontier):

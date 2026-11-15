@@ -154,7 +154,7 @@ O notebook de gate imprime `PASSOU` ou `REPROVOU` com os números. Se reprovar, 
 
 **Como foi implementado** (`scripts/f1a_self_distill.py`, notebook `F1a_self_distill.ipynb`):
 - **Dataset:** `agentica-org/DeepCoder-Preview-Dataset`, config `taco`, com o commit fixado (TACO-verified filtrado, MIT, enunciados humanos, >= 5 testes). Ficam de fora o KodCode (gerado pelo GPT-4o), o `primeintellect` (sintético) e o `lcbv5` (são problemas do LCB v6). Só problemas stdin/stdout: os funcionais do TACO não trazem a assinatura no enunciado. Sai também o problema cujo enunciado aceita mais de uma saída ("print any"), porque a comparação exata reprovaria soluções certas.
-- **Dedup:** 13-gramas de palavras contra LCB v6, HumanEval+, MBPP+ e o custom; sai o problema que divide >= 30% dos 13-gramas com algum problema de benchmark.
+- **Dedup:** 13-gramas de palavras contra LCB v6, HumanEval+, MBPP+; sai o problema que divide >= 30% dos 13-gramas com algum problema de benchmark.
 - **Cascata, no lugar de N=8 amostras longas para todo problema.** Um problema resolvido num estágio não entra nos seguintes:
 
   | Estágio | Chat template do Dory | Amostras | Teto de tokens | Conta como resolvido |
@@ -177,7 +177,7 @@ O notebook de gate imprime `PASSOU` ou `REPROVOU` com os números. Se reprovar, 
 
 #### F1c: GRPO com penalidade de comprimento (`F1c_grpo_length.ipynb`)
 - `trl.GRPOTrainer` (verificar compatibilidade com o modelo `trust_remote_code`; se não houver, implementar um loop GRPO mínimo).
-- Recompensa em `lib/rewards.py`: `r = pass_tests(answer) - λ * n_cot_tokens / L_ref`, com bônus pequeno para o formato correto.
+- Recompensa em `lib/rewards.py`: `r = acerto × exp(−λ · max(0, n_cot_tokens − B) / L_ref)`, sem bônus de formato. Resposta que não fecha o `</think>` vale 0 e nem vai para o sandbox. `L_ref` e a franquia `B` saem da mediana da CoT medida na F1a (`data/f1a/stats.json`).
 - **Sweep:** λ ∈ {0, 0.1, 0.3, 1.0} × loops de treino ∈ {1, 2, 4}. Começar por λ ∈ {0.1, 0.3} com 2 loops e expandir se o compute permitir.
 - Rollouts com `max_new_tokens` limitado (ex.: 4096) para viabilizar o HF generate.
 - **Aceite:** gráfico Pareto com todas as combinações, mostrando quantos tokens de CoT cada loop extra substitui.

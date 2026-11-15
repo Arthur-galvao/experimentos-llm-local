@@ -21,7 +21,6 @@ from lib.dory import (
     TOKENIZER_TEST_TEXTS,
     DoryConfig,
     DoryForCausalLM,
-    init_new_tokens_embeddings,
     logit_lens_per_loop,
     set_dory_loops,
     verify_tokenizer_equivalence,
@@ -243,30 +242,10 @@ def test_reward_synthetic_cases() -> None:
         "```python\ndef add(a, b):\n    return a - b\n```"
     )
 
-    r_short = compute_reward(
-        short_correct,
-        test_code=test_suite,
-        tokenizer=tokenizer,
-        lam=0.1,
-        l_ref=100.0,
-        format_bonus_val=0.05,
-    )
-    r_long = compute_reward(
-        long_correct,
-        test_code=test_suite,
-        tokenizer=tokenizer,
-        lam=0.1,
-        l_ref=100.0,
-        format_bonus_val=0.05,
-    )
-    r_wrong = compute_reward(
-        wrong_completion,
-        test_code=test_suite,
-        tokenizer=tokenizer,
-        lam=0.1,
-        l_ref=100.0,
-        format_bonus_val=0.05,
-    )
+    kw = dict(test_code=test_suite, tokenizer=tokenizer, lam=0.2, l_ref=100.0, free_tokens=10)
+    r_short = compute_reward(short_correct, **kw)
+    r_long = compute_reward(long_correct, **kw)
+    r_wrong = compute_reward(wrong_completion, **kw)
 
     assert r_short.passed_tests is True
     assert r_long.passed_tests is True
@@ -275,30 +254,39 @@ def test_reward_synthetic_cases() -> None:
     assert r_short.n_cot_tokens == 4
     assert r_long.n_cot_tokens == 110
 
-    # Exact formula checks: r = pass_score - lam * (n_cot / l_ref) + format_bonus
-    assert abs(r_short.total_reward - (1.0 - 0.1 * (4 / 100.0) + 0.05)) < 1e-6
-    assert abs(r_long.total_reward - (1.0 - 0.1 * (110 / 100.0) + 0.05)) < 1e-6
-    assert abs(r_wrong.total_reward - (0.0 - 0.1 * (4 / 100.0) + 0.05)) < 1e-6
+    # Exact formula: r = passed * exp(-lam * max(0, n_cot - free) / l_ref); abaixo de free não há penalidade
+    assert abs(r_short.total_reward - 1.0) < 1e-9
+    assert abs(r_long.total_reward - math.exp(-0.2 * (110 - 10) / 100.0)) < 1e-9
+    assert r_wrong.total_reward == 0.0
 
     # Ordering: correct/short > correct/long > wrong
     assert r_short.total_reward > r_long.total_reward > r_wrong.total_reward
 
     # CoT truncada com código correto dentro do raciocínio: não passa (senão o GRPO premia truncar)
     truncated = "add a and b ```python\ndef add(a, b):\n    return a + b\n```"  # <think> veio no prompt
-    r_trunc = compute_reward(
-        truncated, test_code=test_suite, tokenizer=tokenizer, lam=0.1, l_ref=100.0, prompt_ended_with_think=True
-    )
-    assert r_trunc.passed_tests is False
+    r_trunc = compute_reward(truncated, **kw)
+    assert r_trunc.passed_tests is False and r_trunc.total_reward == 0.0
 
-    # Also verify GRPOTrainer wrapper function
-    grpo_fn = make_grpo_reward_fn(tokenizer=tokenizer, lam=0.1, l_ref=100.0, format_bonus_val=0.05)
+    # Also verify GRPOTrainer wrapper function (prompts no formato chat; <think> sempre pré-preenchido)
+    chat_prompt = [{"role": "user", "content": "x"}]
+    grpo_fn = make_grpo_reward_fn(tokenizer=tokenizer, lam=0.2, l_ref=100.0, free_tokens=10)
     batch_rewards = grpo_fn(
-        prompts=["Solve add", "Solve add", "Solve add"],
+        prompts=[chat_prompt] * 3,
         completions=[short_correct, long_correct, wrong_completion],
         test_code=[test_suite, test_suite, test_suite],
     )
     assert len(batch_rewards) == 3
     assert batch_rewards[0] > batch_rewards[1] > batch_rewards[2]
+
+    # Raciocínio longo com código correto mas sem </think> vale 0; correto curto > correto longo
+    code_block = "```python\ndef add(a, b):\n    return a + b\n```"
+    no_close = f"{long_cot_words} {code_block}"
+    rs = grpo_fn(
+        prompts=[chat_prompt] * 3,
+        completions=[no_close, short_correct, long_correct],
+        test_code=[test_suite] * 3,
+    )
+    assert rs[0] == 0.0 and rs[1] > rs[2] > 0.0
 
 
 # ==============================================================================
@@ -428,70 +416,51 @@ def test_logit_lens_last_loop_with_output_block_matches_forward() -> None:
     )
 
 
-# ==============================================================================
-# 5. Mandatory Test: New tokens with untied embeddings initialized + round-trip
-# ==============================================================================
-def test_new_tokens_untied_embeddings_init_and_roundtrip() -> None:
-    model, tokenizer = _make_tiny_dory(n_loops=2)
-    assert model.config.tie_word_embeddings is False
+def test_gradient_checkpointing_and_masked_loss_match_reference() -> None:
+    import unittest.mock as mock
 
-    old_vocab_size = len(tokenizer)
-    in_emb_before = model.get_input_embeddings().weight.detach().clone()
-    out_emb_before = model.get_output_embeddings().weight.detach().clone()
-
-    for_id = tokenizer.convert_tokens_to_ids("for")
-    loop_id = tokenizer.convert_tokens_to_ids("loop")
-    if torch is not None:
-        expected_in_vec = _flatten_floats(in_emb_before[[for_id, loop_id]].float().mean(dim=0))
-        expected_out_vec = _flatten_floats(out_emb_before[[for_id, loop_id]].float().mean(dim=0))
-    else:
-        expected_in_vec = in_emb_before[[for_id, loop_id]].mean_axis0()
-        expected_out_vec = out_emb_before[[for_id, loop_id]].mean_axis0()
-
-    new_tokens_map = {
-        "<FOR_LOOP>": "for loop",
-        "<IF_BRANCH>": "if else",
-        "<LATENT>": "step 1 2",
-    }
-    assigned = init_new_tokens_embeddings(model, tokenizer, new_tokens_map)
-
-    assert len(tokenizer) == old_vocab_size + 3
-    assert model.get_input_embeddings().weight.shape[0] == old_vocab_size + 3
-    assert model.get_output_embeddings().weight.shape[0] == old_vocab_size + 3
-    # Untied weights must not share storage
-    assert (
-        model.get_input_embeddings().weight.data_ptr()
-        != model.get_output_embeddings().weight.data_ptr()
+    cfg = DoryConfig(
+        vocab_size=64, hidden_size=32, num_hidden_layers=6, intermediate_size=64, num_attention_heads=2,
+        num_key_value_heads=1, head_dim=16, n_input_layers=2, n_recurrent_layers=2, n_output_layers=2,
+        layer_types=["full_attention", "mlp"] * 3,
     )
 
-    for tok_str, tok_id in assigned.items():
-        in_vec = _flatten_floats(model.get_input_embeddings().weight[tok_id])
-        out_vec = _flatten_floats(model.get_output_embeddings().weight[tok_id])
-        assert not any(math.isnan(v) for v in in_vec)
-        assert not any(math.isnan(v) for v in out_vec)
-        assert sum(abs(v) for v in in_vec) > 0.0
-        assert sum(abs(v) for v in out_vec) > 0.0
+    def build() -> DoryForCausalLM:
+        torch.manual_seed(0)
+        return DoryForCausalLM(cfg)
 
-    # Verify exact subtoken mean initialization for `<FOR_LOOP>`
-    for_loop_id = assigned["<FOR_LOOP>"]
-    assert _vectors_close(
-        model.get_input_embeddings().weight[for_loop_id],
-        expected_in_vec,
-        atol=1e-5,
-    )
-    assert _vectors_close(
-        model.get_output_embeddings().weight[for_loop_id],
-        expected_out_vec,
-        atol=1e-5,
-    )
+    torch.manual_seed(1)
+    ids = torch.randint(0, 64, (2, 7))
+    labels = ids.clone()
+    labels[0, :3] = -100  # prompt mascarado
 
-    # Verify encode/decode round-trip
-    sample_dsl = "<think> <FOR_LOOP> x <IF_BRANCH> return sum </think>"
-    encoded_ids = tokenizer.encode(sample_dsl, add_special_tokens=False)
-    assert assigned["<FOR_LOOP>"] in encoded_ids
-    assert assigned["<IF_BRANCH>"] in encoded_ids
-    decoded_str = tokenizer.decode(encoded_ids, skip_special_tokens=False)
-    assert decoded_str == sample_dsl
+    ref = build()
+    ref.train()
+    out_ref = ref(input_ids=ids, labels=labels)
+    out_ref.loss.backward()
+    assert out_ref.logits is None  # treino com labels não materializa os logits completos
+
+    ck = build()
+    ck.gradient_checkpointing_enable()
+    ck.train()
+    with mock.patch("torch.utils.checkpoint.checkpoint", wraps=torch.utils.checkpoint.checkpoint) as spy:
+        out_ck = ck(input_ids=ids, labels=labels)
+        out_ck.loss.backward()
+    assert spy.call_count == 2 + 2 * cfg.n_recurrent_loops + 2
+    assert torch.allclose(out_ck.loss, out_ref.loss, atol=1e-6)
+    for (name, p_ref), (_, p_ck) in zip(ref.named_parameters(), ck.named_parameters()):
+        assert (p_ref.grad is None) == (p_ck.grad is None), name
+        if p_ref.grad is not None:
+            assert torch.allclose(p_ref.grad, p_ck.grad, atol=1e-5), name
+
+    # Perda só nas posições com label != -100 igual à fórmula antiga sobre os logits completos (modo eval)
+    ref.eval()
+    out_eval = ref(input_ids=ids, labels=labels)
+    assert out_eval.logits.shape == (2, 7, 64)
+    old_loss = torch.nn.functional.cross_entropy(
+        out_eval.logits[..., :-1, :].reshape(-1, 64), labels[..., 1:].reshape(-1), ignore_index=-100
+    )
+    assert torch.allclose(out_eval.loss, old_loss, atol=1e-6)
 
 
 # ==============================================================================
@@ -563,6 +532,23 @@ def test_registry_and_pareto_and_phase_gate() -> None:
         assert verdict_fail_scicode["passed"] is False
         assert verdict_fail_scicode["status"] == "REPROVOU"
 
+        # Gate com baseline: perder em qualquer tier (aqui easy) impede de vencer
+        base_rec = {**r1, "config": {"easy_pass1": 0.9, "hard_pass1": None}}
+        worse_easy = {**r2, "config": {"easy_pass1": 0.8, "hard_pass1": 0.1}}
+        assert check_phase_gate([worse_easy], [r1], baseline_record=base_rec)["passed"] is False
+        ok_easy = {**r2, "config": {"easy_pass1": 0.9}}
+        assert check_phase_gate([ok_easy], [r1], baseline_record=base_rec)["passed"] is True
+
+        # Linha truncada sem newline no jsonl: o próximo append não cola nela e o load ignora a quebrada
+        with results_file.open("a", encoding="utf-8") as f:
+            f.write('{"run_id": "quebrada"')
+        append_result(
+            run_id="x", phase="F1", model="m", checkpoint="base", n_loops=None, eval_tier="quick",
+            bench="b", pass1=0.1, tokens_cot_mean=1.0, tokens_total_mean=2.0, latency_mean_s=0.1,
+            results_path=results_file,
+        )
+        assert [r["run_id"] for r in load_results(results_file)][-1] == "x"
+
 
 def test_checkpoint_manager_and_resumable_progress() -> None:
     with tempfile.TemporaryDirectory() as tmp:
@@ -594,7 +580,7 @@ def test_hw_config_and_lcb_quick_split() -> None:
         cfg_40 = get_hw_config("grpo", profile="a100_40")
         assert cfg_80["num_generations"] == 8
         assert cfg_40["num_generations"] == 4
-        assert cfg_40["load_in_4bit"] is True
+        assert cfg_40["peft_type"] == "lora" and "load_in_4bit" not in cfg_40
 
         synthetic_lcb = [
             {"question_id": f"q_{i}", "contest_date": f"2025-01-{i:02d}", "question_content": "print(1)"}
@@ -827,9 +813,6 @@ def test_hf_cache_never_points_to_drive_and_ensure_model_files() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        stale_cache = tmp_path / "hf_cache"
-        stale_cache.mkdir(parents=True, exist_ok=True)
-        (stale_cache / "corrupted.json").write_text("{bad", encoding="utf-8")
 
         # Hermético: no Colab `is_colab()` é True e o código usaria o Drive (montagem + pasta real) em vez
         # do `local_fallback_root` temporário. Força o ramo local e restaura as variáveis de ambiente ao sair.
@@ -855,7 +838,6 @@ def test_hf_cache_never_points_to_drive_and_ensure_model_files() -> None:
             assert os.environ["HF_HOME"] == "/root/.cache/huggingface"
             assert os.environ["HF_HUB_CACHE"] == "/root/.cache/huggingface/hub"
             assert os.environ["HF_DATASETS_CACHE"] == "/root/.cache/huggingface/datasets"
-            assert not stale_cache.exists()
 
         # Test ensure_model_files with corrupted tokenizer.json
         model_dir = tmp_path / "hub_mock"
@@ -1884,8 +1866,8 @@ class CriticalModulesTestSuite(unittest.TestCase):
     def test_4_dory_n_loops_changes_output_and_runtime(self) -> None:
         test_dory_n_loops_changes_output_and_runtime()
 
-    def test_5_new_tokens_untied_embeddings_init_and_roundtrip(self) -> None:
-        test_new_tokens_untied_embeddings_init_and_roundtrip()
+    def test_5_gradient_checkpointing_and_masked_loss(self) -> None:
+        test_gradient_checkpointing_and_masked_loss_match_reference()
 
     def test_6_registry_and_pareto_and_phase_gate(self) -> None:
         test_registry_and_pareto_and_phase_gate()

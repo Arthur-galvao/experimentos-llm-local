@@ -21,6 +21,7 @@ import functools
 import heapq
 import itertools
 import random
+import time
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -1051,7 +1052,9 @@ def make_problem(family: Family, idx: int) -> dict[str, Any]:
     """Uma instância determinística (família, índice) no formato do `_run_problems_loop`."""
     rng = random.Random(f"{CUSTOM_SEED}:{family.name}:{idx}")
     params = family.make_params(rng)
+    t0 = time.perf_counter()
     cases = [(args, family.solve(params, *copy.deepcopy(args))) for args in family.make_inputs(rng, params)]
+    ref_s = time.perf_counter() - t0
     examples = "\n".join(f"{_call_repr(family.fn, a)} == {e!r}" for a, e in cases[:2])
     statement = f"{family.describe(params)}\n\nExamples:\n{examples}"
     prompt = (
@@ -1073,7 +1076,9 @@ def make_problem(family: Family, idx: int) -> dict[str, Any]:
         "prompt": prompt,
         "test_code": test_code,
         "entry_point": family.fn,
-        "sandbox_kwargs": dict(SANDBOX_KWARGS),
+        # Como o EvalPlus: o limite acompanha o tempo da referência NESTA máquina, para CPU lenta não
+        # reprovar solução certa. Nunca fica abaixo do limite fixo do protocolo.
+        "sandbox_kwargs": {**SANDBOX_KWARGS, "timeout_s": max(SANDBOX_KWARGS["timeout_s"], 8 * ref_s)},
         "tier": family.tier,
         "family": family.name,
         "params": params,
@@ -1088,8 +1093,9 @@ def build_custom_suite(subset: str = "quick") -> list[dict[str, Any]]:
     return [make_problem(f, i) for i in range(INSTANCES_PER_FAMILY[subset]) for f in FAMILIES]
 
 
-def _fail_bucket(row: dict[str, Any]) -> str:
-    if row.get("truncated"):
+def _fail_bucket(row: dict[str, Any], budget: int | None = None) -> str:
+    # `truncated` só marca quem não fechou o </think>; quem fechou e bateu no orçamento teve o código cortado
+    if row.get("truncated") or (budget and float(row.get("n_total_tokens", 0)) >= budget):
         # "loop" = estourou o orçamento repetindo o mesmo bloco; "truncated" = ainda estava raciocinando
         return "loop" if float(row.get("loop_score", 0.0)) >= LOOP_SCORE_THRESHOLD else "truncated"
     return {"EmptyCode": "no_code", "AssertionError": "wrong_answer", "TimeoutError": "timeout"}.get(
@@ -1131,13 +1137,17 @@ def custom_extra_metrics(
         out[f"{tier}_tokens_cot_median"] = _median([float(r.get("n_cot_tokens", 0)) for r in rs])
         out[f"{tier}_truncated_frac"] = mean(float(bool(r.get("truncated"))) for r in rs)
         # separa errou o raciocínio (wrong_answer/timeout), não coube (truncated) e travou repetindo (loop)
-        out[f"{tier}_fail_breakdown"] = dict(Counter(_fail_bucket(r) for r in rs if not r.get("passed")))
+        out[f"{tier}_fail_breakdown"] = dict(
+            Counter(_fail_bucket(r, max_new_tokens) for r in rs if not r.get("passed"))
+        )
     ok = [r for r in rows.values() if r.get("passed")]
     out["tokens_cot_mean_correct"] = mean(float(r.get("n_cot_tokens", 0)) for r in ok)
     lat = sum(float(r.get("latency_s", 0.0)) for r in rows.values())
     tok = sum(float(r.get("n_total_tokens", 0)) for r in rows.values())
     out["throughput_tok_s"] = round(tok / lat, 1) if lat > 0 else None
-    out["fail_breakdown"] = dict(Counter(_fail_bucket(r) for r in rows.values() if not r.get("passed")))
+    out["fail_breakdown"] = dict(
+        Counter(_fail_bucket(r, max_new_tokens) for r in rows.values() if not r.get("passed"))
+    )
     fam: dict[str, list[float]] = {}
     for tid, r in rows.items():
         fam.setdefault(tid.split("/")[1], []).append(float(bool(r.get("passed"))))

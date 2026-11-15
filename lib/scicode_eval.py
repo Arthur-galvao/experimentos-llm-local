@@ -34,7 +34,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .sandbox import SandboxResult, _kill_process_tree
+from .sandbox import SandboxResult, _child_env, _kill_process_tree
 
 _HERE = Path(__file__).resolve().parent
 SCICODE_SHIM_DIR = _HERE / "scicode_shim"
@@ -333,7 +333,7 @@ def run_scicode_script(script: str, *, timeout_s: float = SCICODE_TEST_TIMEOUT_S
     with tempfile.TemporaryDirectory(prefix="scicode_") as tmp:
         script_path = Path(tmp) / f"{name}.py"
         script_path.write_text(script, encoding="utf-8")
-        env = os.environ.copy()
+        env = _child_env()
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(SCICODE_SHIM_DIR), env.get("PYTHONPATH", "")]))
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env.setdefault("MPLBACKEND", "Agg")

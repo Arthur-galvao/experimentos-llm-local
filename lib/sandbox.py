@@ -4,8 +4,10 @@ with strict wall-clock timeout and OS-level memory limits (Section 4 F1 & Sectio
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -31,12 +33,14 @@ class SandboxResult:
     error_type: str | None = None
 
 
-def extract_python_code(text: str) -> str:
+def extract_python_code(text: str, entry_point: str | None = None) -> str:
     """Extract Python solution code from model output.
 
     If `<think>...</think>` is still attached, strips the thinking block first.
     If markdown fenced code blocks exist, returns the last ````python ... ```` block
     (since reasoning models often refine code and put the final solution last).
+    Com `entry_point`, fica o último bloco que define essa função: a resposta pode terminar com um
+    bloco de exemplo de uso, que não é a solução.
     """
     if not text:
         return ""
@@ -48,8 +52,15 @@ def extract_python_code(text: str) -> str:
 
     matches = _CODE_BLOCK_RE.findall(text)
     if matches:
+        if entry_point:
+            matches = [m for m in matches if re.search(rf"\bdef\s+{re.escape(entry_point)}\b", m)] or matches
         return matches[-1].strip()
     return text.strip()
+
+
+def _child_env() -> dict[str, str]:
+    """Ambiente do processo que roda código gerado pelo modelo, sem tokens nem chaves (HF_TOKEN etc.)."""
+    return {k: v for k, v in os.environ.items() if not re.search(r"TOKEN|SECRET|PASSWORD|API_?KEY", k.upper())}
 
 
 _RUNNER_TEMPLATE = r'''import os
@@ -137,7 +148,7 @@ def run_code_in_sandbox(
         runner_path.write_text(_RUNNER_TEMPLATE, encoding="utf-8")
         target_path.write_text(code, encoding="utf-8")
 
-        env = os.environ.copy()
+        env = _child_env()
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
         env["OMP_NUM_THREADS"] = "1"  # como o EvalPlus oficial (evita estourar RLIMIT_AS com threads de BLAS)
@@ -433,7 +444,7 @@ def run_io_tests_in_sandbox(
             encoding="utf-8",
         )
 
-        env = os.environ.copy()
+        env = _child_env()
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["OMP_NUM_THREADS"] = "1"
 
@@ -793,7 +804,7 @@ def _run_evalplus_runner(
         runner_path.write_text(_EVALPLUS_RUNNER_TEMPLATE, encoding="utf-8")
         with spec_path.open("wb") as fh:
             _pickle.dump(spec, fh)
-        env = os.environ.copy()
+        env = _child_env()
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["OMP_NUM_THREADS"] = "1"
         env["OPENBLAS_NUM_THREADS"] = "1"
@@ -982,18 +993,12 @@ def check_solution(
     seguem o LiveCodeBench oficial (ver `run_io_tests_in_sandbox`). `fn_name` ativa o modo funcional
     (LeetCode); `timeout_s` passa a ser o limite por teste e `max_memory_mb` o RLIMIT_AS do processo.
     """
-    code = extract_python_code(candidate_text_or_code)
+    code = extract_python_code(candidate_text_or_code, entry_point=entry_point or fn_name)
     if not code.strip():
-        return SandboxResult(
-            passed=False,
-            timed_out=False,
-            memory_exceeded=False,
-            exit_code=1,
-            stdout="",
-            stderr="Empty solution code",
-            elapsed_s=0.0,
-            error_type="EmptyCode",
-        )
+        return SandboxResult(False, False, False, 1, "", "Empty solution code", 0.0, "EmptyCode")
+    if not io_examples and not test_code:
+        # sem teste nenhum o script só carregaria a solução e sairia com 0: isso não é acerto
+        return SandboxResult(False, False, False, 1, "", "No tests for this problem", 0.0, "NoTests")
 
     if io_examples:
         return run_io_tests_in_sandbox(
@@ -1005,14 +1010,16 @@ def check_solution(
             max_memory_mb=max_memory_mb,
         )
 
-    full_script = code
-    if test_code:
-        full_script = f"{code}\n\n{test_code}\n"
-        if entry_point and f"check({entry_point})" not in test_code and "def check(" in test_code:
-            full_script += f"\ncheck({entry_point})\n"
-
-    return run_code_in_sandbox(
-        full_script,
+    full_script = f"{code}\n\n{test_code}\n"
+    if entry_point and f"check({entry_point})" not in test_code and "def check(" in test_code:
+        full_script += f"\ncheck({entry_point})\n"
+    # Código 0 não basta: a solução pode encerrar o processo antes dos testes (sys.exit no bloco __main__).
+    marker = f"__tests_done_{secrets.token_hex(8)}__"
+    res = run_code_in_sandbox(
+        full_script + f'\nprint("{marker}")\n',
         timeout_s=timeout_s,
         max_memory_mb=max_memory_mb,
     )
+    if res.passed and marker not in res.stdout:
+        return dataclasses.replace(res, passed=False, error_type="ExitBeforeTests")
+    return res

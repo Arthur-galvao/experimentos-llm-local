@@ -85,6 +85,8 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
             # custom_protocol, não eval_protocol: o da Qwen ganha sufixo da amostragem (ex.: custom_v4_k20_pp1.5)
             or (r.get("config") or {}).get("custom_protocol") == CUSTOM_PROTOCOL_ID
         ]
+        # reruns acrescentam linhas ao jsonl: só o último registro de cada (run, bench, eval) vale
+        f0_records = list({(r["run_id"], r["bench"], r["eval"]): r for r in f0_records}.values())
         print(f"Total de registros F0 em {results_jsonl}: {len(f0_records)}\n")
         header = (
             f"{'run_id':18s} | {'eval':6s} | {'bench':14s} | {'loops':5s} | "

@@ -1,11 +1,16 @@
-"""Critical Module: GRPO reward calculation with accuracy, CoT length penalty, and format bonus (Section 4 F1)."""
+"""Critical Module: GRPO reward = passed * exp(-lam * max(0, n_cot - free_tokens) / l_ref).
+
+Sem bônus de formato: reasoning que nunca fecha `</think>` tem resposta vazia, então não passa e vale 0.
+Só a CoT acima de `free_tokens` é penalizada, e a penalidade multiplica o acerto (errado vale sempre 0).
+"""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .gen import THINK_CLOSE, THINK_OPEN, split_cot_and_answer, _count_tokens
+from .gen import split_cot_and_answer, _count_tokens
 from .sandbox import check_solution
 
 
@@ -15,59 +20,31 @@ class RewardBreakdown:
 
     total_reward: float
     pass_score: float
-    length_penalty: float
-    format_bonus: float
+    length_factor: float
     n_cot_tokens: int
     passed_tests: bool
-
-
-def has_valid_think_format(
-    completion_text: str,
-    *,
-    prompt_ended_with_think: bool = False,
-) -> bool:
-    """Return True if the completion properly closes `</think>` and provides a non-empty final answer."""
-    text = completion_text or ""
-    if prompt_ended_with_think:
-        if THINK_CLOSE not in text:
-            return False
-        _, answer = split_cot_and_answer(text, prompt_ended_with_think=True)
-        return bool(answer.strip())
-
-    open_idx = text.find(THINK_OPEN)
-    close_idx = text.find(THINK_CLOSE)
-    if open_idx == -1 or close_idx == -1 or open_idx >= close_idx:
-        return False
-    _, answer = split_cot_and_answer(text, prompt_ended_with_think=False)
-    return bool(answer.strip())
 
 
 def compute_reward(
     completion_text: str,
     *,
+    l_ref: float,
+    free_tokens: int,
     passed_tests: bool | None = None,
     test_code: str | None = None,
     entry_point: str | None = None,
     io_examples: list[dict[str, str]] | None = None,
     tokenizer: Any | None = None,
     n_cot_tokens: int | None = None,
-    lam: float = 0.1,
-    l_ref: float = 512.0,
-    format_bonus_val: float = 0.05,
-    prompt_ended_with_think: bool = False,
-    timeout_s: float = 4.0,
-    max_memory_mb: int = 512,
+    lam: float = 0.2,
+    prompt_ended_with_think: bool = True,
+    timeout_s: float = 6.0,
+    max_memory_mb: int = 4096,
 ) -> RewardBreakdown:
-    """Compute the GRPO reward defined in Section 4 (F1) of `ESPEC_ANTIGRAVITY.md`:
+    """Compute `passed * exp(-lam * max(0, n_cot_tokens - free_tokens) / l_ref)`.
 
-        r = pass_tests(answer) - lam * (n_cot_tokens / L_ref) + format_bonus
-
-    where:
-      - `pass_tests(answer)` is 1.0 if all tests pass in the sandbox, 0.0 otherwise.
-      - `lam` (λ) is the CoT compression weight (e.g., 0.05, 0.1, 0.2).
-      - `l_ref` (L_ref) is the reference median CoT length of the baseline (> 0).
-      - `format_bonus` is `format_bonus_val` (default 0.05) if `<think>...</think>` is properly
-        formatted and followed by a non-empty answer, else 0.0.
+    `passed` is 1.0 if the answer (text after `</think>`) passes all tests in the sandbox. An empty answer
+    (reasoning never closed) is a fail and is not sent to the sandbox.
     """
     if l_ref <= 0:
         raise ValueError(f"l_ref must be > 0, got {l_ref}")
@@ -79,31 +56,24 @@ def compute_reward(
         n_cot_tokens = _count_tokens(cot_text, tokenizer)
 
     if passed_tests is None:
-        # CoT truncada (resposta vazia) vale 0; avaliar rascunho da CoT premiaria o truncamento no GRPO.
-        candidate_for_sandbox = answer_text
-        sandbox_res = check_solution(
-            candidate_for_sandbox,
-            test_code=test_code,
-            entry_point=entry_point,
-            io_examples=io_examples,
-            timeout_s=timeout_s,
-            max_memory_mb=max_memory_mb,
-        )
-        passed_tests = sandbox_res.passed
+        if not answer_text.strip():
+            passed_tests = False
+        else:
+            passed_tests = check_solution(
+                answer_text,
+                test_code=test_code,
+                entry_point=entry_point,
+                io_examples=io_examples,
+                timeout_s=timeout_s,
+                max_memory_mb=max_memory_mb,
+            ).passed
 
     pass_score = 1.0 if passed_tests else 0.0
-    length_penalty = float(lam) * (float(n_cot_tokens) / float(l_ref))
-    fmt_ok = has_valid_think_format(
-        completion_text, prompt_ended_with_think=prompt_ended_with_think
-    )
-    fmt_bonus = float(format_bonus_val) if fmt_ok else 0.0
-
-    total = pass_score - length_penalty + fmt_bonus
+    length_factor = math.exp(-float(lam) * max(0, int(n_cot_tokens) - int(free_tokens)) / float(l_ref))
     return RewardBreakdown(
-        total_reward=total,
+        total_reward=pass_score * length_factor,
         pass_score=pass_score,
-        length_penalty=length_penalty,
-        format_bonus=fmt_bonus,
+        length_factor=length_factor,
         n_cot_tokens=int(n_cot_tokens),
         passed_tests=bool(passed_tests),
     )
@@ -111,12 +81,13 @@ def compute_reward(
 
 def make_grpo_reward_fn(
     *,
+    l_ref: float,
+    free_tokens: int,
     tokenizer: Any | None = None,
-    lam: float = 0.1,
-    l_ref: float = 512.0,
-    format_bonus_val: float = 0.05,
-    timeout_s: float = 4.0,
-    max_memory_mb: int = 512,
+    lam: float = 0.2,
+    prompt_ended_with_think: bool = True,
+    timeout_s: float = 6.0,
+    max_memory_mb: int = 4096,
 ) -> Callable[..., list[float]]:
     """Create a TRL `GRPOTrainer`-compatible reward function `reward_fn(prompts, completions, **kwargs)`."""
 
@@ -136,13 +107,6 @@ def make_grpo_reward_fn(
             else:
                 comp_str = str(comp)
 
-            prompt_item = prompts[idx] if idx < len(prompts) else ""
-            if isinstance(prompt_item, list) and prompt_item and isinstance(prompt_item[-1], dict):
-                prompt_str = str(prompt_item[-1].get("content", ""))
-            else:
-                prompt_str = str(prompt_item)
-
-            ended_with_think = prompt_str.rstrip().endswith(THINK_OPEN)
             breakdown = compute_reward(
                 comp_str,
                 test_code=test_codes[idx] if idx < len(test_codes) else None,
@@ -151,8 +115,8 @@ def make_grpo_reward_fn(
                 tokenizer=tokenizer,
                 lam=lam,
                 l_ref=l_ref,
-                format_bonus_val=format_bonus_val,
-                prompt_ended_with_think=ended_with_think,
+                free_tokens=free_tokens,
+                prompt_ended_with_think=prompt_ended_with_think,
                 timeout_s=timeout_s,
                 max_memory_mb=max_memory_mb,
             )

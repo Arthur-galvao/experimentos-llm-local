@@ -56,11 +56,6 @@ def setup_drive_and_cache(
     plots_dir = results_dir / "plots"
     data_dir = base_dir / "data"
 
-    # Remove stale corrupted hf_cache on Drive if present
-    stale_hf_cache = base_dir / "hf_cache"
-    if stale_hf_cache.exists():
-        shutil.rmtree(stale_hf_cache, ignore_errors=True)
-
     for d in (base_dir, checkpoints_dir, eval_cache_dir, results_dir, plots_dir, data_dir):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -142,7 +137,8 @@ class CheckpointManager:
 
     def find_latest_checkpoint(self) -> Path | None:
         """Return the latest valid checkpoint directory if one exists."""
-        ckpts = self.list_checkpoints()
+        # state.json é gravado por último: checkpoint sem ele ficou pela metade
+        ckpts = [c for c in self.list_checkpoints() if (c / "state.json").exists()]
         return ckpts[-1] if ckpts else None
 
     def should_save(self, step: int) -> bool:

@@ -93,7 +93,11 @@ def append_result(
 
     path = Path(results_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # linha anterior truncada (crash) sem newline colaria o novo registro nela
+    needs_nl = path.exists() and path.stat().st_size > 0 and not path.read_bytes().endswith(b"\n")
     with path.open("a", encoding="utf-8") as f:
+        if needs_nl:
+            f.write("\n")
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
         f.flush()
 
@@ -119,7 +123,11 @@ def load_results(
             line = line.strip()
             if not line:
                 continue
-            row = json.loads(line)
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"[registry] aviso: linha invalida ignorada em {path}")
+                continue
             if phase is not None and row.get("phase") != phase:
                 continue
             if eval_tier is not None and row.get("eval") != eval_tier:
