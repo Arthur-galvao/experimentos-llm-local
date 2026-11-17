@@ -122,6 +122,26 @@ sync_quality_to_out() {
   fi
 }
 
+# Sobe o que já existe a cada etapa: a sessão pode acabar no Ctrl-C e o disco do lab pode não persistir.
+upload_results() {
+  sync_quality_to_out || true
+  mkdir -p "$OUT_DIR/lab_check" "$OUT_DIR/logs"
+  cp -a "$DORY_LAB_HOME"/lab_check_*.txt "$OUT_DIR/lab_check/" 2>/dev/null || true
+  cp -a "$DORY_LAB_HOME"/logs/. "$OUT_DIR/logs/" 2>/dev/null || true
+  local origem=""
+  [ -s "$SOURCE_FILE" ] && origem="$(head -n 1 "$SOURCE_FILE" | tr -d '\r\n')"
+  if [ -n "$origem" ] && ! is_local_source "$origem" && [ -x "$RCLONE_BIN" ]; then
+    local remote_dest="${origem%/}/results/lab_validation/$HOST"
+    if "$RCLONE_BIN" copy "$OUT_DIR" "$remote_dest" >/dev/null 2>&1; then
+      echo "[UPLOAD] $OUT_DIR -> $remote_dest"
+    else
+      echo "AVISO: upload via rclone falhou; os arquivos continuam em $OUT_DIR"
+    fi
+  else
+    echo "[UPLOAD] origem local: copie $OUT_DIR para o pendrive antes de sair."
+  fi
+}
+
 run_smoke_mode() {
   local mode_label="$1"
   local flag="$2"
@@ -173,6 +193,7 @@ main_bench() {
         --git-sha "$git_sha" \
         --lab-vram-gib "$LAB_VRAM_GIB" || true
     fi
+    upload_results || true
     echo "Progresso preservado em:"
     echo "  - $T4_OUT/quality/"
     echo "  - $OUT_DIR/"
@@ -299,9 +320,29 @@ PY
       --driver-version "$drv_ver" \
       --git-sha "$git_sha" \
       --lab-vram-gib "$LAB_VRAM_GIB" || true
+    upload_results
     return 1
   fi
   echo "Modo escolhido para o quality: $selected_flag"
+  upload_results
+
+  # --- Step 4b: long smoke (bounded long-sequence throughput) ---
+  echo ""
+  echo "=== [4b/7] Smoke longo: 4 sequências × 4096 tokens ($selected_flag) ==="
+  # Garante um número de sequência longa mesmo se o quality (sem limite de tempo por problema) não terminar.
+  local long_flag=""
+  [ "$selected_flag" = "--enforce-eager" ] && long_flag="--enforce-eager"
+  rm -f "$T4_OUT/smoke_int8.json"
+  local long_log="$DORY_LAB_HOME/tmp/smoke_long.log"
+  "$VENV_PY" "$SCRIPT_DIR/long_smoke.py" --repo-root "$REPO_DIR" --n-seqs 4 --max-tokens 4096 $long_flag 2>&1 | tee "$long_log"
+  if [ "${PIPESTATUS[0]}" -eq 0 ] && [ -f "$T4_OUT/smoke_int8.json" ]; then
+    mv "$T4_OUT/smoke_int8.json" "$OUT_DIR/smoke_int8_long.json"
+    echo "[OK] Smoke longo salvo em $OUT_DIR/smoke_int8_long.json (veja tok_s e tokens_generated)"
+  else
+    tail -n 40 "$long_log" > "$OUT_DIR/smoke_int8_long.error.txt" 2>/dev/null || true
+    echo "[FALHOU] Smoke longo falhou (seguindo). Detalhes em $OUT_DIR/smoke_int8_long.error.txt"
+  fi
+  upload_results
 
   # --- Step 5: quality loop with hard deadline ---
   echo ""
@@ -369,7 +410,7 @@ PY
         last_run_s=$((t_end - t_start))
         [ "$last_run_s" -ge 1 ] || last_run_s=1
         echo "Rodada --n-problems $next_n concluída em ${last_run_s}s."
-        sync_quality_to_out
+        upload_results
         next_n=$((next_n + 1))
       done
     fi
@@ -394,23 +435,7 @@ PY
   # --- Step 7: upload or local notice ---
   echo ""
   echo "=== [7/7] Entrega dos resultados ==="
-  local origem=""
-  if [ -s "$SOURCE_FILE" ]; then
-    origem="$(head -n 1 "$SOURCE_FILE" | tr -d '\r\n')"
-  fi
-
-  if [ -n "$origem" ] && ! is_local_source "$origem" && [ -x "$RCLONE_BIN" ]; then
-    local remote_dest="${origem%/}/results/lab_validation/$HOST"
-    echo "Enviando $OUT_DIR -> $remote_dest ..."
-    if "$RCLONE_BIN" copy --progress "$OUT_DIR" "$remote_dest"; then
-      echo "[OK] Resultados enviados para $remote_dest"
-    else
-      echo "AVISO: falha no upload via rclone. Os arquivos locais continuam salvos em: $OUT_DIR"
-    fi
-  else
-    echo "Origem local ou rclone indisponível; copie manualmente os arquivos de:"
-    echo "  $OUT_DIR"
-  fi
+  upload_results
   echo "========================================================================"
 }
 

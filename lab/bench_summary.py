@@ -147,10 +147,15 @@ def _render_markdown(summary: dict[str, Any]) -> str:
     smokes = summary["smokes"]
     lines.append("## 2. Smoke Tests (contexto 12288 tokens)")
     lines.append("")
+    lines.append("Eager e CUDA graphs: 16 sequências × 512 tokens. Longo: 4 sequências × até 4096 tokens, "
+                 "o regime mais próximo da F1a com tempo limitado (veja `tokens_generated` no JSON).")
+    lines.append("")
     lines.append("| Modo | Status | tok/s | KV cache (tokens) | Concorrência máx. | Carga (s) |")
     lines.append("|---|---|---|---|---|---|")
-    for label, key in [("Eager (`--enforce-eager`)", "eager"), ("CUDA Graphs (`--no-enforce-eager`)", "graphs")]:
-        s = smokes[key]
+    rows = [("Eager (`--enforce-eager`)", "eager"), ("CUDA Graphs (`--no-enforce-eager`)", "graphs"),
+            ("Longo 4 × 4096 tokens (modo escolhido)", "long")]
+    for label, key in rows:
+        s = smokes.get(key) or _summarize_smoke(Path("-"), Path("-"))
         lines.append(
             f"| {label} | {s['status']} | {_fmt(s['tok_s'])} | {_fmt(s['kv_cache_size_tokens'])} | "
             f"{_fmt(s['max_concurrency'], 'x' if s['max_concurrency'] is not None else '')} | {_fmt(s['load_s'])} |"
@@ -164,8 +169,8 @@ def _render_markdown(summary: dict[str, Any]) -> str:
     else:
         lines.append("- **Modo escolhido:** nenhum smoke completou com sucesso.")
 
-    for label, key in [("Eager", "eager"), ("CUDA Graphs", "graphs")]:
-        err = smokes[key].get("error")
+    for label, key in [("Eager", "eager"), ("CUDA Graphs", "graphs"), ("Longo", "long")]:
+        err = (smokes.get(key) or {}).get("error")
         if err:
             tail = "\n".join(err.splitlines()[-10:])
             lines.append("")
@@ -238,6 +243,7 @@ def generate_summary(
     eager = _summarize_smoke(out_dir / "smoke_int8_eager.json", out_dir / "smoke_int8_eager.error.txt")
     graphs = _summarize_smoke(out_dir / "smoke_int8_graphs.json", out_dir / "smoke_int8_graphs.error.txt")
     chosen_mode = _choose_mode(eager, graphs)
+    long = _summarize_smoke(out_dir / "smoke_int8_long.json", out_dir / "smoke_int8_long.error.txt")
 
     tp_path = out_dir / "quality" / "throughput_int8.jsonl"
     if not tp_path.exists():
@@ -309,6 +315,7 @@ def generate_summary(
         "smokes": {
             "eager": eager,
             "graphs": graphs,
+            "long": long,
             "chosen_mode": chosen_mode,
         },
         "throughput": {

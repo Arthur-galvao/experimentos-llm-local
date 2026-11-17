@@ -60,6 +60,7 @@ Sem internet: copie a pasta `repo/` do pendrive para `~/dory-lab/repo`.
 | **17:45** | Conferir se o upload via `rclone` terminou (ou copiar `~/dory-lab/drive/results/lab_validation/<hostname>/` para o pendrive) e liberar o laboratório | `ls -lh ~/dory-lab/drive/results/lab_validation/` |
 
 > **Quanto demora o `quality`:** cada problema gera 8 amostras de até 8.192 tokens (até ~65 mil tokens). Na 2060S isso pode levar de dezenas de minutos a mais de 1 hora por problema, sem saída nova na tela enquanto gera. É normal sair da sessão com só 2–4 problemas: o objetivo principal é o tok/s real, não a qualidade.
+> Por isso, antes do `quality`, o bench roda um **smoke longo** (4 sequências × até 4.096 tokens, ~15–40 min) que garante um tok/s em sequência longa mesmo que nenhum problema do `quality` termine. Os resultados (e os `lab_check_*.txt` e `logs/`) **sobem para o Drive depois de cada etapa** e também no Ctrl-C, então pode interromper às 17:40 sem perder nada.
 
 > Dica: se quiser rodar só os smokes primeiro (sem `quality`), use `bash lab/lab_bench.sh --skip-quality`. Para testar em outro horário, ajuste `--deadline HH:MM`.
 
