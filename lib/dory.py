@@ -1214,7 +1214,7 @@ def logit_lens_per_loop(
 ) -> list[dict[str, Any]]:
     """Project intermediate hidden states at the end of each recurrent loop (`1..n_loops`)
     onto `lm_head` to inspect how top-k token predictions evolve across loops for the last
-    `last_n_positions` tokens of `prompt` (Section 2.2 of ESPEC_ANTIGRAVITY.md).
+    `last_n_positions` tokens of `prompt` (Section 2.2 of docs/arquivo/ESPEC_ANTIGRAVITY.md).
 
     Args:
         model: `DoryForCausalLM` instance.

@@ -27,7 +27,7 @@ python scripts/f0_run_baseline.py --target plot
   - Dory: `temperature=1.0`, `top_p=0.95`, sem `top_k` nem penalidade.
   - Qwen3.5-4B, modo de pensamento para tarefas gerais: `temperature=1.0`, `top_p=0.95`, `top_k=20`, `presence_penalty=1.5`. A penalidade é o que a Qwen indica contra repetição infinita.
 - `seed=42`, vLLM.
-- O que já está em `results.jsonl` (mesmo `run_id`, bench e protocolo) não roda de novo.
+- O que já está no registro (`results/results.jsonl` ou `results/runs/`, mesmo `run_id`, bench e protocolo) não roda de novo.
 
 **GPU:** 81.920 tokens por resposta pedem memória. O ideal é G4 (96 GB) ou A100 de 80 GB. Na A100 de 40 GB e na L4, o Dory L4 (cache separado por loop) pode ficar lento, com poucas respostas ao mesmo tempo, ou não caber.
 
@@ -68,7 +68,7 @@ O `tests/test_custom_bench.py` verifica cinco coisas:
 
 ## O que mede, e para qual parte do projeto
 
-Tudo fica no registro de `results.jsonl`: os campos padrão mais o `config`.
+Tudo fica no registro (`results/runs/<run_id>.jsonl`): os campos padrão mais o `config`.
 
 | Métrica | Campo | Serve para |
 |---|---|---|

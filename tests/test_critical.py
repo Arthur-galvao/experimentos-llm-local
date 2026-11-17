@@ -1,4 +1,4 @@
-"""Unit tests for all critical modules in `lib/` (Section 6 of ESPEC_ANTIGRAVITY.md).
+"""Unit tests for all critical modules in `lib/` (Section 6 of docs/arquivo/ESPEC_ANTIGRAVITY.md).
 
 Compatible with both `pytest tests/` (Colab) and `python -m unittest -v tests/test_critical.py` (local).
 """

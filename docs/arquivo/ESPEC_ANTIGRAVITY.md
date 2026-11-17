@@ -1,5 +1,7 @@
 # Especificação para o Agente: Notebooks Colab por Fase
 
+> **Arquivado em 2026-11-17: obsoleto.** Foi a especificação original do F0/F1 e ainda é citada por seção nas docstrings de `lib/`. Onde divergir de `VISAO_GERAL.md` ou do código, valem eles.
+
 > Leia `VISAO_GERAL.md` antes. Este documento diz **o que** implementar, em que ordem e com quais critérios de aceite. Você (agente) escreve o código.
 
 ---

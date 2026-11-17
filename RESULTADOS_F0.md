@@ -1,6 +1,6 @@
 # F0: Setup e baselines (resultado)
 
-Concluído em 2026-11-12. Os números de referência das fases seguintes são os desta página. A fonte de verdade é `MyDrive/coder-comprimido/results/results.jsonl`. As saídas por item ficam em `eval_cache/` e os gráficos em `results/plots/`, todos no Drive.
+Concluído em 2026-11-12. Os números de referência das fases seguintes são os desta página. A fonte de verdade é `MyDrive/coder-comprimido/results/results.jsonl` (registro legado do F0; rodadas novas vão para `results/runs/<run_id>.jsonl`). As saídas por item ficam em `eval_cache/` e os gráficos em `results/plots/`, todos no Drive.
 
 **Configuração fixa** (igual em todas as linhas): vLLM (PR #60149), `max_new_tokens=16000`, `temperature=1.0`, `top_p=0.95`, `seed=42`. **Truncado** = atingiu 16k tokens sem fechar `</think>`; truncado conta como **erro** (ver "Correções").
 
@@ -58,7 +58,7 @@ Teste pareado de McNemar no LCB quick:
 
 ## 5. Correções feitas durante o F0
 
-- **Resposta truncada contava como acerto** (commit `91b55a4`). Sem `</think>`, `lib/evals.py` e `lib/rewards.py` corrigiam o código rascunho da CoT. Agora só a resposta pós-`</think>` é avaliada, e truncado vale erro/0 na recompensa, para o GRPO não premiar truncamento. Os runs já feitos foram recorrigidos por `scripts/f0_rescore_truncated.py`, idempotente e sem regerar; os registros recorrigidos levam `config.rescored_truncated_as_fail=true`. O LCB quick caiu 2–3 pontos no Dory e 6,5 no Qwen; os números acima já estão corrigidos.
+- **Resposta truncada contava como acerto** (commit `91b55a4`). Sem `</think>`, `lib/evals.py` e `lib/rewards.py` corrigiam o código rascunho da CoT. Agora só a resposta pós-`</think>` é avaliada, e truncado vale erro/0 na recompensa, para o GRPO não premiar truncamento. Os runs já feitos foram recorrigidos por `scripts/f0_rescore_truncated.py` (removido do repo depois de aplicado), idempotente e sem regerar; os registros recorrigidos levam `config.rescored_truncated_as_fail=true`. O LCB quick caiu 2–3 pontos no Dory e 6,5 no Qwen; os números acima já estão corrigidos.
 - **SciCode `test_data.h5` sem passo manual** (commit `2e79ac7`). O gdown do Drive oficial batia na cota; o fallback para a cópia do HF foi descrito acima.
 - **Harness:** EvalPlus oficial (base + plus), prompt oficial do LCB, sandbox sem tracing, um subprocesso por motor vLLM, retomada por `eval_cache` (`has_completed_run` pula runs completos sem duplicar linhas).
 

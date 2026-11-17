@@ -85,7 +85,7 @@ def plot_pareto(
     title: str | None = None,
 ) -> Path:
     """Generate and save a scatter plot of `pass@1 x run_cost` with the Pareto frontier
-    highlighted and baseline runs marked (Section 3.4 of ESPEC_ANTIGRAVITY.md).
+    highlighted and baseline runs marked (Section 3.4 of docs/arquivo/ESPEC_ANTIGRAVITY.md).
     """
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -193,7 +193,7 @@ def check_phase_gate(
     max_scicode_drop_pp: float = 2.0,
     baseline_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Evaluate the phase gate criterion (Section 3.5 of ESPEC_ANTIGRAVITY.md):
+    """Evaluate the phase gate criterion (Section 3.5 of docs/arquivo/ESPEC_ANTIGRAVITY.md):
     1. At least one candidate point strictly dominates or extends the previous Pareto frontier:
        - strictly lower `run_cost` with equal-or-higher `pass1`, OR
        - strictly higher `pass1` with equal-or-lower `run_cost`, OR

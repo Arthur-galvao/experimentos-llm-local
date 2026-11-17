@@ -1,4 +1,4 @@
-"""Hardware detection and profile configuration (Section 1.1 of ESPEC_ANTIGRAVITY.md)."""
+"""Hardware detection and profile configuration (Section 1.1 of docs/arquivo/ESPEC_ANTIGRAVITY.md)."""
 
 from __future__ import annotations
 

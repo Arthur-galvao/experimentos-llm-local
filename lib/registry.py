@@ -1,4 +1,4 @@
-"""Experiment registry (Section 3.3 of ESPEC_ANTIGRAVITY.md).
+"""Experiment registry (Section 3.3 of docs/arquivo/ESPEC_ANTIGRAVITY.md).
 
 Cada run grava em `results/runs/<run_id>.jsonl`, para que Colab e lab possam gravar ao mesmo tempo
 no Drive (que não tem lock) sem conflito. `results/results.jsonl` (legado do F0) continua sendo lido.

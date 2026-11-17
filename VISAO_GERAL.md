@@ -1,6 +1,6 @@
 # Projeto: Modelo Coder com Raciocínio Comprimido
 
-> Documento de visão geral. A especificação de implementação (notebooks do Colab) está em `ESPEC_ANTIGRAVITY.md`.
+> Documento de visão geral. Onde fica cada coisa (código, Drive, Colab, lab): [README.md](README.md). A especificação original de implementação está arquivada em `docs/arquivo/ESPEC_ANTIGRAVITY.md` (obsoleta).
 
 ## 1. Objetivo
 

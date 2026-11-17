@@ -9,6 +9,12 @@ __pycache__/
 results/
 data/
 checkpoints/
+eval_cache/
+wheels/
+
+# Documentos privados (PDFs, conceitos não publicados) ficam em docs/ do Drive central
+*.pdf
+CONCEITO_*.md
 
 # Pesos de modelo
 *.safetensors

@@ -816,7 +816,7 @@ def eval_lcb_pro(
     force: bool = False,
 ) -> dict[str, Any] | None:
     """Attempt to evaluate LiveCodeBench Pro locally without external paid APIs.
-    Per Section 3.2 of `ESPEC_ANTIGRAVITY.md`, if LCB Pro lacks local self-contained test cases,
+    Per Section 3.2 of `docs/arquivo/ESPEC_ANTIGRAVITY.md`, if LCB Pro lacks local self-contained test cases,
     logs the exact reason and keeps LCB v6 as the primary competitive reference.
     """
     try:
