@@ -135,9 +135,12 @@ def _run_single_target(target: str, repo_root: Path, scope: str = "quick") -> No
             print(f"Gráfico salvo em: {out_plot}")
 
         local_results_dir = repo_root / "results"
-        if local_results_dir.resolve() != paths["results"].resolve() and results_jsonl.exists():
+        if local_results_dir.resolve() != paths["results"].resolve() and (results_jsonl.exists() or (paths["results"] / "runs").is_dir()):
             local_results_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(results_jsonl, local_results_dir / "results.jsonl")
+            if results_jsonl.exists():
+                shutil.copy2(results_jsonl, local_results_dir / "results.jsonl")
+            if (paths["results"] / "runs").is_dir():
+                shutil.copytree(paths["results"] / "runs", local_results_dir / "runs", dirs_exist_ok=True)
             local_plots_dir = local_results_dir / "plots"
             local_plots_dir.mkdir(parents=True, exist_ok=True)
             for p in plots_dir.glob("*.png"):

@@ -1,9 +1,14 @@
-"""Experiment registry for results/results.jsonl (Section 3.3 of ESPEC_ANTIGRAVITY.md)."""
+"""Experiment registry (Section 3.3 of ESPEC_ANTIGRAVITY.md).
+
+Cada run grava em `results/runs/<run_id>.jsonl`, para que Colab e lab possam gravar ao mesmo tempo
+no Drive (que não tem lock) sem conflito. `results/results.jsonl` (legado do F0) continua sendo lido.
+"""
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -27,6 +32,12 @@ RESULT_FIELDS: tuple[str, ...] = (
 )
 
 DEFAULT_RESULTS_PATH = Path("results") / "results.jsonl"
+
+
+def run_results_path(results_path: str | Path, run_id: str) -> Path:
+    """Arquivo de um run: `<pasta de results_path>/runs/<run_id>.jsonl`."""
+    safe = re.sub(r"[^\w.+-]", "_", str(run_id))  # fora da f-string: Python < 3.12 não aceita \ nela
+    return Path(results_path).parent / "runs" / f"{safe}.jsonl"
 
 
 def get_git_sha(cwd: str | Path | None = None) -> str:
@@ -65,7 +76,7 @@ def append_result(
     git_sha: str | None = None,
     timestamp: str | None = None,
 ) -> dict[str, Any]:
-    """Append a standardized benchmark result line to `results/results.jsonl`.
+    """Append a standardized benchmark result line to `results/runs/<run_id>.jsonl`.
 
     Automatically computes `acerto_por_1k_tokens = pass1 / max(tokens_cot_mean / 1000.0, 1e-6)`
     (using `tokens_total_mean` as fallback only when `tokens_cot_mean <= 0`).
@@ -91,7 +102,7 @@ def append_result(
         "timestamp": timestamp or dt.datetime.now(dt.timezone.utc).isoformat(),
     }
 
-    path = Path(results_path)
+    path = run_results_path(results_path, run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     # linha anterior truncada (crash) sem newline colaria o novo registro nela
     needs_nl = path.exists() and path.stat().st_size > 0 and not path.read_bytes().endswith(b"\n")
@@ -112,31 +123,35 @@ def load_results(
     bench: str | None = None,
     run_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Load and optionally filter experiment records from `results/results.jsonl`."""
-    path = Path(results_path)
-    if not path.exists():
-        return []
+    """Load and filter records from the legacy `results.jsonl` plus every `runs/*.jsonl`, oldest first."""
+    legacy = Path(results_path)
+    paths = [legacy, *sorted((legacy.parent / "runs").glob("*.jsonl"))]
 
     records: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                print(f"[registry] aviso: linha invalida ignorada em {path}")
-                continue
-            if phase is not None and row.get("phase") != phase:
-                continue
-            if eval_tier is not None and row.get("eval") != eval_tier:
-                continue
-            if bench is not None and row.get("bench") != bench:
-                continue
-            if run_id is not None and row.get("run_id") != run_id:
-                continue
-            records.append(row)
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    print(f"[registry] aviso: linha invalida ignorada em {path}")
+                    continue
+                if phase is not None and row.get("phase") != phase:
+                    continue
+                if eval_tier is not None and row.get("eval") != eval_tier:
+                    continue
+                if bench is not None and row.get("bench") != bench:
+                    continue
+                if run_id is not None and row.get("run_id") != run_id:
+                    continue
+                records.append(row)
+    # ordem cronológica entre arquivos; sort estável preserva a ordem dentro do mesmo timestamp
+    records.sort(key=lambda r: str(r.get("timestamp") or ""))
     return records
 
 

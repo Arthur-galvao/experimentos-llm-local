@@ -8,7 +8,7 @@ set -euo pipefail
 VLLM_SPEC="vllm @ git+https://github.com/vllm-project/vllm.git@refs/pull/60149/head"
 EXTRAS="accelerate datasets evalplus matplotlib pytest trl peft"
 PY=$(python -c 'import sys; print(f"py{sys.version_info[0]}{sys.version_info[1]}")')
-WHEELS="${WHEELS_DIR:-/content/drive/MyDrive/coder-comprimido/wheels}/${PY}-vllm-pr60149"
+WHEELS="${WHEELS_DIR:-${CODER_DRIVE_ROOT:-/content/drive/MyDrive/coder-comprimido}/wheels}/${PY}-vllm-pr60149"
 LOCAL=/content/wheels_tmp
 
 nvidia-smi --query-gpu=name,memory.total --format=csv

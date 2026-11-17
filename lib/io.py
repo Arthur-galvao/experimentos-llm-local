@@ -9,7 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-DEFAULT_DRIVE_ROOT = "/content/drive/MyDrive/coder-comprimido"
+# Troque com CODER_DRIVE_ROOT (ex.: atalho para o Drive central) antes de importar lib.
+DEFAULT_DRIVE_ROOT = os.environ.get("CODER_DRIVE_ROOT", "/content/drive/MyDrive/coder-comprimido")
 DEFAULT_LOCAL_HF_HOME = "/root/.cache/huggingface"
 
 
