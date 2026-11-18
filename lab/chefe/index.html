@@ -1,0 +1,50 @@
+<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><title>Dory Lab</title>
+<style>
+body{font-family:system-ui,Segoe UI,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;padding:18px}
+h1{font-size:20px;margin:0 0 4px}.sub{color:#8a8f98;font-size:13px;margin-bottom:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:14px}
+.card{background:#181b22;border:1px solid #262a33;border-radius:10px;padding:14px}
+.top{display:flex;justify-content:space-between;align-items:center}.name{font-size:18px;font-weight:600}
+.pill{font-size:12px;padding:2px 8px;border-radius:99px}.run{background:#163d24;color:#5fd38a}.idle{background:#3a3216;color:#e0c25a}.off{background:#3d1616;color:#f07070}
+.row{display:flex;gap:10px;margin:10px 0}.kpi{flex:1;background:#11141a;border-radius:8px;padding:8px}
+.kpi b{display:block;font-size:20px}.kpi span{font-size:11px;color:#8a8f98}
+.bar{height:8px;background:#11141a;border-radius:4px;overflow:hidden;margin:3px 0 8px}.bar i{display:block;height:100%}
+.step{font-size:13px;color:#b9c0cc;margin:6px 0}.prog{font-family:Consolas,monospace;font-size:11px;color:#8a8f98;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}td,th{padding:3px 4px;border-bottom:1px solid #232733;text-align:right}td:first-child,th:first-child{text-align:left}
+th{color:#8a8f98;font-weight:500}.best{color:#5fd38a;font-weight:600}svg{width:100%;height:60px;background:#11141a;border-radius:6px}
+.cmp{margin-top:16px}
+</style></head><body>
+<h1>Dory INT8 · Lab RTX 2060 SUPER</h1><div class="sub">Chefe 9.06 · atualiza a cada 3 s · <span id="clock"></span></div>
+<div class="grid" id="grid"></div>
+<div class="card cmp"><div class="name">Comparação (todas as configurações medidas)</div><table id="cmp"></table></div>
+<script>
+const fmt=(v,d=1)=>v==null?'—':(+v).toFixed(d);
+function spark(h,idx,max,color){if(!h.length)return '';const t0=h[0][0],t1=h[h.length-1][0]||t0+1;
+ const pts=h.filter(p=>p[idx]!=null).map(p=>`${((p[0]-t0)/Math.max(1,t1-t0)*300).toFixed(1)},${(58-(p[idx]/max)*56).toFixed(1)}`).join(' ');
+ return `<polyline fill="none" stroke="${color}" stroke-width="1.5" points="${pts}"/>`}
+async function tick(){
+ let r;try{r=await (await fetch('/api')).json()}catch(e){return}
+ document.getElementById('clock').textContent=new Date().toLocaleTimeString();
+ const rows=[];let html='';
+ for(const [n,s] of Object.entries(r.state)){
+  const h=r.hist[n]||[];const g=s.gpu||{};
+  const pill=!s.ok?'<span class="pill off">sem conexão</span>':s.running?'<span class="pill run">rodando</span>':'<span class="pill idle">ocioso</span>';
+  const memp=g.mem_total?g.mem_used/g.mem_total*100:0;
+  let res='';for(const [k,v] of Object.entries(s.results||{})){if(v.tok_s==null&&!v.error)continue;
+   rows.push({pc:n,k,...v});res+=`<tr><td>${k.replace('smoke_int8_','')}</td><td>${fmt(v.tok_s)}</td><td>${v.kv_cache_size_tokens??'—'}</td><td>${fmt(v.max_concurrency,2)}</td><td>${v.n_seqs??''}×${v.max_tokens??''}</td></tr>`}
+  html+=`<div class="card"><div class="top"><div class="name">PC ${n} <span style="font-size:12px;color:#8a8f98">${s.host||''} ${s.ip||''}</span></div>${pill}</div>
+  ${s.ok?'':`<div class="step">${s.err||''}</div>`}
+  <div class="row"><div class="kpi"><b>${g.util??'—'}%</b><span>GPU</span></div><div class="kpi"><b>${g.mem_used??'—'}</b><span>VRAM MiB / ${g.mem_total??''}</span></div>
+  <div class="kpi"><b>${s.live_out_tok_s??'—'}</b><span>tok/s agora</span></div><div class="kpi"><b>${g.temp??'—'}°</b><span>${fmt(g.power,0)} W</span></div></div>
+  <div class="bar"><i style="width:${g.util||0}%;background:#4f8cff"></i></div><div class="bar"><i style="width:${memp}%;background:#c77dff"></i></div>
+  <svg viewBox="0 0 300 60" preserveAspectRatio="none">${spark(h,1,100,'#4f8cff')}${spark(h,2,g.mem_total||8192,'#c77dff')}</svg>
+  <div class="step"><b>Etapa:</b> ${s.step||'—'}</div><div class="prog">${(s.progress||'').replace(/</g,'&lt;')}</div>
+  <table><tr><th>teste</th><th>tok/s</th><th>KV tokens</th><th>conc.</th><th>seqs×tok</th></tr>${res}</table></div>`}
+ document.getElementById('grid').innerHTML=html;
+ const bt=Math.max(0,...rows.map(x=>x.tok_s||0)),bk=Math.max(0,...rows.map(x=>x.kv_cache_size_tokens||0));
+ const bf=Math.max(0,...rows.map(x=>x.seqs_fit_f1a_8192||0));
+ rows.sort((a,b)=>(b.tok_s||0)-(a.tok_s||0));
+ document.getElementById('cmp').innerHTML='<tr><th>PC</th><th>teste</th><th>tok/s</th><th>KV tokens</th><th>conc.</th><th>seqs×tok</th><th>fit F1a 8k</th><th>pico VRAM</th><th>carga s</th><th>status</th></tr>'+
+  rows.map(x=>`<tr><td>${x.pc}</td><td>${x.k.replace('smoke_int8_','')}</td><td class="${x.tok_s==bt?'best':''}">${fmt(x.tok_s)}</td><td class="${x.kv_cache_size_tokens==bk?'best':''}">${x.kv_cache_size_tokens??'—'}</td><td>${fmt(x.max_concurrency,2)}</td><td>${x.n_seqs??''}×${x.max_tokens??''}</td><td class="${x.seqs_fit_f1a_8192==bf?'best':''}">${fmt(x.seqs_fit_f1a_8192,2)}</td><td>${x.peak_vram_mib??'—'}</td><td>${fmt(x.load_s)}</td><td title="${(x.error||'').replace(/"/g,'')}">${x.status||'OK'}</td></tr>`).join('')}
+tick();setInterval(tick,3000);
+</script></body></html>
